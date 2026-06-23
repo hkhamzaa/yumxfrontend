@@ -5,7 +5,6 @@ import Link from 'next/link'
 import SplitText from '@/components/ui/SplitText'
 import { useLoadingReporter } from '@/components/loader/LoadingProvider'
 
-// 9:16 portrait clips, scrubbed by scroll on mobile. Order = scroll order.
 const VIDEOS = [
   '/videos/hero-video.mp4',
   '/videos/burger-video.mp4',
@@ -13,31 +12,33 @@ const VIDEOS = [
   '/videos/fries-video.mp4',
 ]
 
-// Scroll "dwell" per clip, in svh. Section height = 100svh sticky + dwell.
 const DWELL_VH = 50
-// Fraction of each segment spent crossfading into the next clip.
-const FADE = 0.4
+const FADE     = 0.4
 
-// Short punchy text for clips 1 (burger), 2 (wings), 3 (fries)
+// Lerp scales with scroll velocity so the scrub feels 1:1 during a fast fling
+// and silky-settling when the finger lifts.
+//   vel (px/ms)  lerp
+//   0            0.055  → gentle glide to rest
+//   1            ~0.22  → smooth follow
+//   3            ~0.53  → near-direct
+//   5+           0.65   → capped, feels instant
+const LERP_BASE  = 0.055
+const LERP_SCALE = 0.12
+const LERP_CAP   = 0.65
+
+// Only seek when the target differs by ≥ 1 frame at 30 fps.
+const SEEK_THR = 1 / 30
+
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
   { pre: 'Stacked &', accent: 'Bold'  },
   { pre: 'Saucy &',   accent: 'Wild'  },
   { pre: 'Golden &',  accent: 'Crisp' },
 ]
 
-// Absolute position tailwind classes per clip text overlay
-const CLIP_TEXT_POSITIONS = [
-  'bottom-28 left-5',
-  'bottom-28 left-5',
-  'bottom-28 left-5',
-]
+const CLIP_TEXT_POSITIONS = ['bottom-28 left-5', 'bottom-28 left-5', 'bottom-28 left-5']
+const CLIP_TEXT_ALIGNS    = ['left', 'left', 'left'] as const
 
-// Text alignment per overlay
-const CLIP_TEXT_ALIGNS = ['left', 'left', 'left'] as const
-
-function clamp01(n: number) {
-  return n < 0 ? 0 : n > 1 ? 1 : n
-}
+function clamp01(n: number) { return n < 0 ? 0 : n > 1 ? 1 : n }
 
 function smoothstep(n: number) {
   const t = clamp01(n)
@@ -45,13 +46,19 @@ function smoothstep(n: number) {
 }
 
 /**
- * Mobile hero: a pinned stack of portrait videos. Scroll progress (0→1)
- * crossfades hero → burger → wings → fries, then releases into the page.
- * Videos are stacked bottom→top; each upper clip fades in over the one below
- * across its segment boundary, so once faded in it fully covers the prior clip.
+ * Mobile hero: portrait videos scrubbed by scroll.
  *
- * When each food clip reaches its second-to-last second a glassmorphic text
- * badge animates in using SplitText char-by-char.
+ * Zero-jank architecture:
+ *  • Section geometry cached once (mount + resize) — never queried inside rAF.
+ *  • Passive scroll listener writes scrollY + measures velocity into refs —
+ *    the rAF loop reads refs only, no DOM queries.
+ *  • Adaptive lerp: lerp = LERP_BASE + velocity * LERP_SCALE, capped at LERP_CAP.
+ *    Fast scroll → near-direct; stopped → silky glide to rest.
+ *  • Velocity decays per-frame (×0.88) to approximate momentum deceleration.
+ *  • Off-screen layers (opacity < 0.01 and not in crossfade) are skipped entirely —
+ *    no decoder wakeup for invisible clips.
+ *  • `translateZ(0)` on every video + layer forces independent GPU compositor
+ *    layers; opacity changes never touch the main thread.
  */
 export function MobileHero() {
   const sectionRef      = useRef<HTMLElement>(null)
@@ -61,30 +68,24 @@ export function MobileHero() {
   const textRef         = useRef<HTMLDivElement>(null)
   const scrollHintRef   = useRef<HTMLDivElement>(null)
   const rafRef          = useRef<number>(0)
-  const activeRef       = useRef(-1)
-  const endedRef        = useRef<Set<number>>(new Set())
-  // Furthest clip the user is allowed to reach. Advances once the current clip's
-  // video has played fully OR the user makes a second attempt to scroll past it,
-  // so a fast/heavy scroll can't skip a clip on the first try.
-  // Starts at 1: the looping hero (clip 0) never gates.
-  const allowedClipRef  = useRef(1)
-  // True while the user is parked against the active gate (held by the clamp).
-  const atGateRef       = useRef(false)
-  // Timestamp of the last wheel event, used to detect a fresh wheel gesture.
-  const lastWheelRef    = useRef(0)
 
-  // rAF-accessible flags — avoids state reads inside the animation loop
+  // Section geometry — written on mount + resize, never inside rAF
+  const sectionTopRef = useRef(0)
+  const denomRef      = useRef(1)
+
+  // Scroll state — written by passive listener, read by rAF (zero layout force)
+  const targetPRef  = useRef(0)          // raw scroll → progress [0,1]
+  const smoothPRef  = useRef(0)          // lerped display progress
+  const velRef      = useRef(0)          // |px/ms|, drives adaptive lerp
+  const prevScrollY = useRef(0)
+  const prevScrollT = useRef(performance.now())
+
   const textAnimatedRef = useRef([false, false, false])
-  // React state to drive SplitText re-renders
   const [textTriggered, setTextTriggered] = useState([false, false, false])
-  // Increment to force-remount SplitText (resets its internal animation state)
-  const [textKeys, setTextKeys] = useState([0, 0, 0])
+  const [textKeys,      setTextKeys]      = useState([0, 0, 0])
 
   const count = VIDEOS.length
 
-  // Report load state of the first (visible) clip to the page loader. The hero is
-  // "rendered fully" once that clip's first frame is decoded; later clips stream
-  // in lazily as the user scrolls and must not gate the loader.
   const { reportReady, setProgress: reportProgress } = useLoadingReporter()
   const heroReadyRef = useRef(false)
 
@@ -100,101 +101,128 @@ export function MobileHero() {
     try {
       const end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0
       reportProgress('hero', end / v.duration)
-    } catch { /* buffered can throw mid-load — ignore */ }
+    } catch {}
   }, [reportProgress])
 
-  // Catch the case where the clip is already buffered before listeners attach.
+  // Catch already-buffered first clip
   useEffect(() => {
     const v = videoRefs.current[0]
-    if (v && v.readyState >= 2 /* HAVE_CURRENT_DATA */) markHeroReady()
+    if (v && v.readyState >= 2) markHeroReady()
   }, [markHeroReady])
 
-  /* Opacity of clip `i` at scroll progress `p` (0..1 over the whole section). */
+  // Keep every video paused — currentTime is fully scroll-driven
+  useEffect(() => {
+    videoRefs.current.forEach(v => { if (v) v.pause() })
+  }, [])
+
+  // ── Section geometry (mount + resize) ────────────────────────────────────────
+  const calcGeometry = useCallback(() => {
+    const el = sectionRef.current
+    if (!el) return
+    sectionTopRef.current = el.getBoundingClientRect().top + window.scrollY
+    denomRef.current      = Math.max(1, el.offsetHeight - window.innerHeight)
+  }, [])
+
+  useEffect(() => {
+    calcGeometry()
+    window.addEventListener('resize', calcGeometry, { passive: true })
+    return () => window.removeEventListener('resize', calcGeometry)
+  }, [calcGeometry])
+
+  // ── Passive scroll listener — velocity + progress, zero DOM reads in rAF ─────
+  useEffect(() => {
+    const onScroll = () => {
+      const now  = performance.now()
+      const dt   = now - prevScrollT.current
+      if (dt > 0) {
+        velRef.current = Math.abs((window.scrollY - prevScrollY.current) / dt)
+      }
+      prevScrollY.current = window.scrollY
+      prevScrollT.current = now
+      targetPRef.current  = clamp01((window.scrollY - sectionTopRef.current) / denomRef.current)
+    }
+    // Seed before first rAF fires
+    prevScrollY.current = window.scrollY
+    prevScrollT.current = performance.now()
+    targetPRef.current  = clamp01((window.scrollY - sectionTopRef.current) / denomRef.current)
+
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
+
+  // ── Opacity of clip i at scroll progress p ────────────────────────────────────
   const layerOpacity = useCallback((i: number, p: number) => {
     if (i === 0) return 1
-    const seg = 1 / count
+    const seg      = 1 / count
     const boundary = i * seg
     const halfFade = (seg * FADE) / 2
     return smoothstep((p - (boundary - halfFade)) / (halfFade * 2))
   }, [count])
 
-  /* rAF-driven scroll sync: write opacities directly, toggle play/pause. */
+  // ── rAF loop — zero DOM reads, pure ref reads + style writes ─────────────────
   const update = useCallback(() => {
-    const el = sectionRef.current
-    if (!el) return
-    const rect  = el.getBoundingClientRect()
-    const denom = rect.height - window.innerHeight
-    let p = denom > 0 ? clamp01(-rect.top / denom) : 0
+    // Adaptive lerp: scales with velocity so fast scroll ≈ direct, stopped = silky
+    const lerp = Math.min(LERP_CAP, LERP_BASE + velRef.current * LERP_SCALE)
+    smoothPRef.current += (targetPRef.current - smoothPRef.current) * lerp
 
-    // ── Forward gate ────────────────────────────────────────────────
-    // Hold the page at the current clip until its video has played fully,
-    // so a fast/heavy scroll can't fling past a clip before it plays.
-    // Only forward overshoot is clamped — scrolling back up stays free.
-    const allowed = allowedClipRef.current
-    if (denom > 0 && allowed < count) {
-      const seg      = 1 / count
-      const halfFade = (seg * FADE) / 2
-      const maxP     = (allowed + 1) * seg - halfFade
-      if (p > maxP) {
-        const sectionAbsTop = rect.top + window.scrollY
-        window.scrollTo(0, sectionAbsTop + maxP * denom)
-        p = maxP
-      }
-      // Parked against the gate → a fresh scroll gesture counts as a 2nd try.
-      atGateRef.current = p >= maxP - 0.004
-    } else {
-      atGateRef.current = false
-    }
+    // Velocity decays each frame to approximate momentum deceleration
+    velRef.current *= 0.88
 
-    let topMost = 0
+    const p   = smoothPRef.current
+    const seg = 1 / count
+
+    // ── Scrub video currentTime ───────────────────────────────────────────────
     for (let i = 0; i < count; i++) {
-      const o = layerOpacity(i, p)
-      const layer = layerRefs.current[i]
-      if (layer) layer.style.opacity = String(o)
-      if (o >= 0.5) topMost = i
+      const v = videoRefs.current[i]
+      if (!v || !isFinite(v.duration) || v.duration <= 0) continue
+
+      // Skip off-screen layers that aren't in a crossfade transition
+      const op  = layerOpacity(i, p)
+      const nOp = i + 1 < count ? layerOpacity(i + 1, p) : 0
+      const inCrossfade = op > 0.01 || nOp > 0.01 || i === 0
+      if (!inCrossfade) continue
+
+      const t      = clamp01((p - i * seg) / seg)
+      const target = t * v.duration
+      if (Math.abs(v.currentTime - target) > SEEK_THR) {
+        v.currentTime = target
+      }
     }
 
-    // Drive text overlay visibility: fade in with its clip, fade out when next clip fades in
+    // ── Layer opacities ───────────────────────────────────────────────────────
+    for (let i = 0; i < count; i++) {
+      const layer = layerRefs.current[i]
+      if (layer) layer.style.opacity = String(layerOpacity(i, p))
+    }
+
+    // ── Text badge visibility ─────────────────────────────────────────────────
     for (let i = 0; i < 3; i++) {
       const overlay = textOverlayRefs.current[i]
       if (overlay) {
         const fadeIn  = layerOpacity(i + 1, p)
         const fadeOut = i + 2 < count ? layerOpacity(i + 2, p) : 0
-        const clipOp  = fadeIn * (1 - fadeOut)
-        overlay.style.opacity = textAnimatedRef.current[i] ? String(clipOp) : '0'
+        overlay.style.opacity = textAnimatedRef.current[i]
+          ? String(fadeIn * (1 - fadeOut))
+          : '0'
+      }
+
+      const progressInClip = clamp01((p - (i + 1) * seg) / seg)
+      if (progressInClip >= 0.75 && !textAnimatedRef.current[i]) {
+        textAnimatedRef.current[i] = true
+        setTextTriggered(prev => { const n = [...prev]; n[i] = true; return n })
+      } else if (progressInClip < 0.45 && textAnimatedRef.current[i]) {
+        textAnimatedRef.current[i] = false
+        setTextTriggered(prev => { const n = [...prev]; n[i] = false; return n })
+        setTextKeys(prev => { const n = [...prev]; n[i]++; return n })
       }
     }
 
-    if (topMost !== activeRef.current) {
-      activeRef.current = topMost
-      videoRefs.current.forEach((v, i) => {
-        if (!v) return
-        if (i === topMost) {
-          if (i > 0 && endedRef.current.has(i)) {
-            endedRef.current.delete(i)
-            v.currentTime = 0
-            // Reset the text badge so it can animate again on replay
-            const ti = i - 1
-            if (textAnimatedRef.current[ti]) {
-              textAnimatedRef.current[ti] = false
-              setTextTriggered(prev => { const n = [...prev]; n[ti] = false; return n })
-              setTextKeys(prev => { const n = [...prev]; n[ti]++; return n })
-            }
-          }
-          v.play().catch(() => {})
-        } else {
-          v.pause()
-        }
-      })
-    }
-
-    // Hero text fades out as the first transition begins.
+    // ── Hero text fade ────────────────────────────────────────────────────────
     if (textRef.current) {
       const t = 1 - layerOpacity(1, p)
-      textRef.current.style.opacity = String(t)
+      textRef.current.style.opacity   = String(t)
       textRef.current.style.transform = `translateY(${(1 - t) * -24}px)`
     }
-
     if (scrollHintRef.current) {
       scrollHintRef.current.style.opacity = p < 0.04 ? '0.6' : '0'
     }
@@ -202,52 +230,10 @@ export function MobileHero() {
     rafRef.current = requestAnimationFrame(update)
   }, [count, layerOpacity])
 
-  // A food clip finished: unlock the next clip so the page can scroll past it.
-  const handleEnded = useCallback((videoIndex: number) => {
-    endedRef.current.add(videoIndex)
-    if (videoIndex === allowedClipRef.current) {
-      allowedClipRef.current = videoIndex + 1
-    }
-  }, [])
-
-  // Fires when a food clip reaches its last seconds, triggering the text badge.
-  const handleTimeUpdate = useCallback((videoIndex: number) => {
-    const v = videoRefs.current[videoIndex]
-    if (!v || !isFinite(v.duration) || v.duration <= 0) return
-    const ti = videoIndex - 1
-    if (v.currentTime >= v.duration - 4 && !textAnimatedRef.current[ti]) {
-      textAnimatedRef.current[ti] = true
-      setTextTriggered(prev => { const n = [...prev]; n[ti] = true; return n })
-    }
-  }, [])
-
   useEffect(() => {
-    // The forward gate's clamp lives in the rAF loop (see `update`). These
-    // listeners only detect a *second* attempt to scroll past a held clip:
-    // a fresh gesture while parked at the gate lets the user through early.
-    const tryPass = () => {
-      if (atGateRef.current && allowedClipRef.current < count) {
-        allowedClipRef.current += 1
-      }
-    }
-    const onTouchStart = () => tryPass()
-    const onWheel = (e: WheelEvent) => {
-      if (e.deltaY <= 0) return
-      const now = performance.now()
-      const isNewGesture = now - lastWheelRef.current > 200
-      lastWheelRef.current = now
-      if (isNewGesture) tryPass()
-    }
-
     rafRef.current = requestAnimationFrame(update)
-    window.addEventListener('touchstart', onTouchStart, { passive: true })
-    window.addEventListener('wheel', onWheel, { passive: true })
-    return () => {
-      cancelAnimationFrame(rafRef.current)
-      window.removeEventListener('touchstart', onTouchStart)
-      window.removeEventListener('wheel', onWheel)
-    }
-  }, [update, count])
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [update])
 
   return (
     <section
@@ -255,14 +241,23 @@ export function MobileHero() {
       aria-label="Hero"
       style={{ height: `calc(100svh + ${count * DWELL_VH}svh)` }}
     >
+      {/* sticky viewport */}
       <div className="sticky top-0 h-[100svh] overflow-hidden">
-        {/* ── Stacked portrait videos ──────────────────────────────────── */}
+
+        {/* ── Stacked portrait videos ─────────────────────────────────────── */}
         {VIDEOS.map((src, i) => (
           <div
             key={src}
             ref={el => { layerRefs.current[i] = el }}
             className="absolute inset-0"
-            style={{ opacity: i === 0 ? 1 : 0, zIndex: i }}
+            style={{
+              opacity:    i === 0 ? 1 : 0,
+              zIndex:     i,
+              willChange: 'opacity',
+              // translateZ promotes to its own GPU compositor layer so opacity
+              // changes never touch the main thread
+              transform:  'translateZ(0)',
+            }}
             aria-hidden="true"
           >
             <video
@@ -271,23 +266,20 @@ export function MobileHero() {
               muted
               playsInline
               preload="auto"
-              autoPlay={i === 0}
-              loop={i === 0}
-              onEnded={i > 0 ? () => handleEnded(i) : undefined}
-              onTimeUpdate={i > 0 ? () => handleTimeUpdate(i) : undefined}
-              onLoadedData={i === 0 ? markHeroReady : undefined}
+              onLoadedData={i === 0 ? markHeroReady    : undefined}
               onCanPlayThrough={i === 0 ? markHeroReady : undefined}
-              onError={i === 0 ? markHeroReady : undefined}
-              onProgress={i === 0 ? onHeroProgress : undefined}
+              onError={i === 0 ? markHeroReady          : undefined}
+              onProgress={i === 0 ? onHeroProgress      : undefined}
               className="absolute inset-0 w-full h-full object-cover"
+              style={{ transform: 'translateZ(0)' }}
             />
           </div>
         ))}
 
-        {/* ── Gradient overlays for legibility ──────────────────────────── */}
+        {/* ── Gradient veil ────────────────────────────────────────────────── */}
         <div className="absolute inset-0 z-10 bg-gradient-to-b from-brand-bg/40 via-transparent to-brand-bg/80" />
 
-        {/* ── Text cards for clips 1–3 ──────────────────────────────────── */}
+        {/* ── Text badges for clips 1–3 ────────────────────────────────────── */}
         {[0, 1, 2].map(i => (
           <div
             key={i}
@@ -295,27 +287,22 @@ export function MobileHero() {
             className={`absolute z-30 pointer-events-none max-w-[80vw] ${CLIP_TEXT_POSITIONS[i]}`}
             style={{ opacity: 0, willChange: 'opacity' }}
           >
-            <div
-              style={{
-                background: 'rgba(0, 0, 0, 0.38)',
-                backdropFilter: 'blur(14px)',
-                WebkitBackdropFilter: 'blur(14px)',
-                borderRadius: '12px',
-                padding: '14px 22px',
-              }}
-            >
+            <div style={{
+              background: 'rgba(0,0,0,0.38)',
+              backdropFilter: 'blur(14px)',
+              WebkitBackdropFilter: 'blur(14px)',
+              borderRadius: '12px',
+              padding: '14px 22px',
+            }}>
               <SplitText
                 key={`pre-${textKeys[i]}`}
                 text={CLIP_TEXTS[i].pre}
                 tag="p"
                 triggered={textTriggered[i]}
                 className="font-display font-bold text-3xl text-white/90 tracking-tight leading-none"
-                delay={40}
-                duration={1.7}
-                ease="power3.out"
+                delay={40} duration={1.7} ease="power3.out"
                 splitType="chars"
-                from={{ opacity: 0, y: 16 }}
-                to={{ opacity: 1, y: 0 }}
+                from={{ opacity: 0, y: 16 }} to={{ opacity: 1, y: 0 }}
                 textAlign={CLIP_TEXT_ALIGNS[i]}
               />
               <SplitText
@@ -324,38 +311,33 @@ export function MobileHero() {
                 tag="p"
                 triggered={textTriggered[i]}
                 className="font-display font-bold text-5xl italic text-brand-accent tracking-tight leading-none"
-                delay={55}
-                duration={2}
-                ease="power3.out"
+                delay={55} duration={2} ease="power3.out"
                 splitType="chars"
-                from={{ opacity: 0, y: 30 }}
-                to={{ opacity: 1, y: 0 }}
+                from={{ opacity: 0, y: 30 }} to={{ opacity: 1, y: 0 }}
                 textAlign={CLIP_TEXT_ALIGNS[i]}
               />
             </div>
           </div>
         ))}
 
-        {/* ── Hero text (fades out into the first transition) ───────────── */}
+        {/* ── Hero text — fades into first transition ──────────────────────── */}
         <div
           ref={textRef}
           className="absolute inset-0 z-20 flex flex-col justify-end px-6 pb-20"
+          style={{ willChange: 'opacity, transform' }}
         >
           <div className="max-w-[90vw] animate-fade-in">
             <p className="label-caps text-brand-accent mb-4">
               Lahore&apos;s Boldest Fast Food
             </p>
-
             <h1 className="font-display font-bold text-[clamp(2.75rem,11vw,4rem)] leading-[1.05] text-brand-text tracking-tight">
               Real Food.<br />
               <span className="text-brand-accent italic">Fast.</span>
             </h1>
-
             <p className="font-body text-base text-brand-muted leading-relaxed mt-4 mb-7 max-w-sm">
               Crafted with bold flavours, served fast.
               Every bite hits different.
             </p>
-
             <div className="flex flex-col sm:flex-row gap-4">
               <Link
                 href="/menu"
@@ -373,15 +355,16 @@ export function MobileHero() {
           </div>
         </div>
 
-        {/* ── Scroll hint — visibility toggled directly via ref ─────────── */}
+        {/* ── Scroll hint ──────────────────────────────────────────────────── */}
         <div
           ref={scrollHintRef}
-          className="absolute bottom-7 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2 transition-opacity duration-300"
-          style={{ opacity: 0.6 }}
+          className="absolute bottom-7 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2"
+          style={{ opacity: 0.6, willChange: 'opacity' }}
         >
           <span className="label-caps text-brand-muted">Scroll</span>
           <div className="w-px h-9 bg-gradient-to-b from-brand-muted to-transparent animate-pulse" />
         </div>
+
       </div>
     </section>
   )
