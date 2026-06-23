@@ -1,0 +1,395 @@
+generator client {
+  provider   = "prisma-client-js"
+  engineType = "library"
+}
+
+// Prisma 7+: connection URLs are configured in prisma.config.ts, not here.
+// DATABASE_URL → Supabase pgbouncer pooler (port 6543) — runtime PrismaClient
+// DIRECT_URL   → direct Postgres connection (port 5432) — prisma migrate
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AdminRole {
+  SUPERADMIN
+  ADMIN
+}
+
+enum OrderType {
+  DELIVERY
+  PICKUP
+  DINE_IN
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PREPARING
+  OUT_FOR_DELIVERY
+  COMPLETED
+  CANCELLED
+}
+
+// CARD / JAZZCASH / EASYPAISA are reserved for future payment gateway integrations
+enum PaymentMethod {
+  CASH
+  CARD
+  JAZZCASH
+  EASYPAISA
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+}
+
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth & Users
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  role         AdminRole @default(ADMIN)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@map("admin_users")
+}
+
+// email is nullable to support guest checkout — guests have no account.
+// emailVerified / image are required by the NextAuth Prisma adapter (Customer IS the auth user).
+model Customer {
+  id            String        @id @default(cuid())
+  name          String
+  email         String?       @unique
+  emailVerified DateTime?
+  image         String? // Google profile photo populated by OAuth
+  phone         String
+  passwordHash  String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  orders        Order[]
+  reservations  Reservation[]
+  accounts      Account[]
+  sessions      Session[]
+
+  @@map("customers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NextAuth v5 — Prisma adapter models
+// Field names (userId, sessionToken, providerAccountId, etc.) must match the
+// adapter's expectations exactly — do not rename them, even though our "user"
+// is a Customer. The NextAuth adapter config (Phase 2) will point these at
+// prisma.customer rather than prisma.user.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Account {
+  id                String   @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?  @db.Text
+  access_token      String?  @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?  @db.Text
+  session_state     String?
+  customer          Customer @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  customer     Customer @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Menu
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MenuCategory {
+  id           String     @id @default(cuid())
+  name         String
+  slug         String     @unique
+  imageUrl     String?
+  displayOrder Int
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  items        MenuItem[]
+
+  @@index([isActive])
+  @@index([displayOrder])
+  @@map("menu_categories")
+}
+
+model MenuItem {
+  id          String            @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  categoryId  String
+  isAvailable Boolean           @default(true)
+  isFeatured  Boolean           @default(false)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  category    MenuCategory      @relation(fields: [categoryId], references: [id])
+  variants    MenuItemVariant[]
+
+  @@index([categoryId])
+  @@index([isAvailable])
+  @@index([isFeatured])
+  @@map("menu_items")
+}
+
+// Every item — even single-size ones — has at least one variant.
+// This eliminates the "item with sizes vs item without" special-case in the app layer.
+model MenuItemVariant {
+  id         String      @id @default(cuid())
+  menuItemId String
+  label      String // e.g. "Regular", "Small", "Medium", "Large", "5 PCS", "10 PCS"
+  price      Decimal     @db.Decimal(10, 2)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  menuItem   MenuItem    @relation(fields: [menuItemId], references: [id])
+  orderItems OrderItem[]
+
+  @@index([menuItemId])
+  @@map("menu_item_variants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Combo Deals
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Combo deals are a separate top-level entity (not a MenuItem) because they
+// bundle multiple items + drinks under one fixed price (e.g. Deal 01–12).
+model ComboDeal {
+  id           String      @id @default(cuid())
+  dealNumber   String // e.g. "01", "Deal 12" — kept as String for label flexibility
+  title        String
+  description  String?
+  imageUrl     String?
+  price        Decimal     @db.Decimal(10, 2)
+  isActive     Boolean     @default(true)
+  displayOrder Int
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  orderItems   OrderItem[]
+
+  @@index([isActive])
+  @@index([displayOrder])
+  @@map("combo_deals")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Order {
+  // orderNumber is set by the application at creation time (e.g. "YX-1001").
+  // Use an atomic Postgres sequence or a Redis counter to guarantee uniqueness
+  // and lexicographic sortability across concurrent requests.
+  id            String        @id @default(cuid())
+  orderNumber   String        @unique
+  customerId    String?
+  guestName     String?
+  guestPhone    String?
+  guestEmail    String? // optional at checkout; used to auto-link guest orders on sign-up
+  guestAddress  String? // null when orderType is PICKUP or DINE_IN
+  orderType     OrderType
+  status        OrderStatus   @default(PENDING)
+  paymentMethod PaymentMethod @default(CASH)
+  paymentStatus PaymentStatus @default(UNPAID)
+  subtotal          Decimal       @db.Decimal(10, 2)
+  deliveryFee       Decimal       @default(0) @db.Decimal(10, 2)
+  total             Decimal       @db.Decimal(10, 2)
+  notes             String?       @db.Text
+  estimatedMinutes  Int?          // set by admin when confirming
+  readyAt           DateTime?     // confirmedAt + estimatedMinutes, used for customer countdown
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  customer      Customer?     @relation(fields: [customerId], references: [id])
+  items         OrderItem[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([orderType])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  // XOR invariant: exactly one of menuItemVariantId or comboDealId must be non-null per row.
+  // Prisma does not support native XOR check constraints — enforce this in the service layer
+  // before every insert.
+  id                String           @id @default(cuid())
+  orderId           String
+  menuItemVariantId String?
+  comboDealId       String?
+  itemNameSnapshot  String // name captured at order time — never recompute from live menu
+  quantity          Int
+  unitPrice         Decimal          @db.Decimal(10, 2) // price captured at order time
+  lineTotal         Decimal          @db.Decimal(10, 2)
+  order             Order            @relation(fields: [orderId], references: [id])
+  menuItemVariant   MenuItemVariant? @relation(fields: [menuItemVariantId], references: [id])
+  comboDeal         ComboDeal?       @relation(fields: [comboDealId], references: [id])
+
+  @@index([orderId])
+  @@index([menuItemVariantId])
+  @@index([comboDealId])
+  @@map("order_items")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reservations
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Reservation {
+  id         String            @id @default(cuid())
+  customerId String?
+  guestName  String
+  guestPhone String
+  date       DateTime
+  timeSlot   String // e.g. "12:00", "14:30"
+  partySize  Int
+  status     ReservationStatus @default(PENDING)
+  notes      String?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  customer   Customer?         @relation(fields: [customerId], references: [id])
+
+  @@index([customerId])
+  @@index([date])
+  @@index([status])
+  @@map("reservations")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Restaurant Operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+model RestaurantSchedule {
+  id        String   @id @default(cuid())
+  dayOfWeek Int // 0 = Sunday … 6 = Saturday
+  openTime  String // e.g. "09:00"
+  closeTime String // e.g. "23:00"
+  isClosed  Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+
+  @@unique([dayOfWeek])
+  @@map("restaurant_schedules")
+}
+
+model BlockedSlot {
+  id        String   @id @default(cuid())
+  date      DateTime
+  timeSlot  String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([date, timeSlot])
+  @@index([date])
+  @@map("blocked_slots")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Content
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+model GalleryImage {
+  id           String   @id @default(cuid())
+  imageUrl     String
+  caption      String?
+  displayOrder Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([displayOrder])
+  @@map("gallery_images")
+}
+
+model Testimonial {
+  id           String   @id @default(cuid())
+  customerName String
+  rating       Int // 1–5
+  reviewText   String   @db.Text
+  source       String? // e.g. "Google Reviews", "Facebook"
+  displayOrder Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([isActive])
+  @@map("testimonials")
+}
+
+// Key-value store for CMS-editable site content (e.g. "home_hero_title", "about_us_body")
+model SiteContent {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+
+  @@map("site_content")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Password Reset OTPs
+// Shared table for both admin and customer password reset flows.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OtpUserType {
+  ADMIN
+  CUSTOMER
+}
+
+model PasswordResetOtp {
+  id        String      @id @default(cuid())
+  email     String
+  otpCode   String
+  userType  OtpUserType
+  expiresAt DateTime
+  used      Boolean     @default(false)
+  createdAt DateTime    @default(now())
+
+  @@index([email, userType])
+  @@map("password_reset_otps")
+}

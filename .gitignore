@@ -1,0 +1,57 @@
+# dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js build output
+.next/
+out/
+dist/
+
+# production
+build/
+
+# env files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# vercel
+.vercel/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# logs
+logs
+*.log
+
+# coverage (if using tests)
+coverage/
+
+# turbo (if using turborepo)
+.turbo/
+
+# typescript
+*.tsbuildinfo
+
+# optional: testing
+cypress/screenshots/
+cypress/videos/
+
+.open-next/
+.next/
+out/
+dist/
+.wrangler/
+.env
+.env.*
