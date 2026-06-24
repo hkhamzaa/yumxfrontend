@@ -39,7 +39,7 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className={`${playfairDisplay.variable} ${manrope.variable}`}>
+    <html lang="en" className={`${playfairDisplay.variable} ${manrope.variable}`} suppressHydrationWarning>
       <body className="bg-brand-bg text-brand-text font-body antialiased">
         <Providers>
           {children}

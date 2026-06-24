@@ -275,21 +275,24 @@ export function MobileHero() {
     }
 
     // Text badge visibility
+    // Trigger fires as soon as the clip's layer is fully visible (≥95% opacity).
+    // Waiting for 75% dwell leaves only a ~2px scroll window before the next
+    // layer's crossfade erases the overlay — far too short for the animation.
     for (let i = 0; i < 3; i++) {
-      const overlay = textOverlayRefs.current[i]
+      const overlay  = textOverlayRefs.current[i]
+      const layerVis = layerOpacity(i + 1, p)
+
       if (overlay) {
-        const fadeIn  = layerOpacity(i + 1, p)
         const fadeOut = i + 2 < count ? layerOpacity(i + 2, p) : 0
         overlay.style.opacity = textAnimatedRef.current[i]
-          ? String(fadeIn * (1 - fadeOut))
+          ? String(layerVis * (1 - fadeOut))
           : '0'
       }
 
-      const progressInClip = clamp01((p - (i + 1) * seg) / seg)
-      if (progressInClip >= 0.75 && !textAnimatedRef.current[i]) {
+      if (layerVis >= 0.95 && !textAnimatedRef.current[i]) {
         textAnimatedRef.current[i] = true
         setTextTriggered(prev => { const n = [...prev]; n[i] = true; return n })
-      } else if (progressInClip < 0.45 && textAnimatedRef.current[i]) {
+      } else if (layerVis < 0.3 && textAnimatedRef.current[i]) {
         textAnimatedRef.current[i] = false
         setTextTriggered(prev => { const n = [...prev]; n[i] = false; return n })
         setTextKeys(prev => { const n = [...prev]; n[i]++; return n })
