@@ -8,6 +8,7 @@ import { Footer } from '@/components/layout/Footer'
 import { useCartStore, cartSubtotal, type CartItem } from '@/store/cartStore'
 import { formatPrice } from '@/lib/utils'
 import { UnderDevelopmentDialog } from '@/components/ui/UnderDevelopmentDialog'
+import { mockSiteContent } from '@/lib/mock-data'
 
 const ORDER_TYPES = [
   { value: 'DELIVERY' as const, label: 'Delivery', icon: '🛵' },
@@ -136,7 +137,7 @@ export function CartPageClient({ sessionUser }: Props) {
   const [submitting, setSubmitting] = useState(false)
   const [apiError, setApiError] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<FieldError>({})
-  const [deliveryFee, setDeliveryFee] = useState(0)
+  const deliveryFee = parseFloat(mockSiteContent.delivery_fee) || 0
   const [maintenanceOpen, setMaintenanceOpen] = useState(false)
 
   const [form, setForm] = useState<FormState>({
@@ -149,19 +150,6 @@ export function CartPageClient({ sessionUser }: Props) {
   })
 
   useEffect(() => { setMounted(true) }, [])
-
-  // Fetch delivery fee from site content
-  useEffect(() => {
-    fetch('/api/public/site-content')
-      .then(r => r.json())
-      .then((json: { success: boolean; data: Record<string, string> }) => {
-        if (json.success && json.data.delivery_fee) {
-          const parsed = parseFloat(json.data.delivery_fee)
-          if (!isNaN(parsed) && parsed >= 0) setDeliveryFee(parsed)
-        }
-      })
-      .catch(() => {})
-  }, [])
 
   // Pre-fill from session if logged in
   useEffect(() => {

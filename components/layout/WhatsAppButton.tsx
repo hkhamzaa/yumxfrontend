@@ -1,28 +1,11 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { mockSiteContent } from '@/lib/mock-data'
 
-interface SiteContent {
-  whatsapp_number?: string
-}
+const phone = mockSiteContent.whatsapp_number.replace(/\D/g, '')
 
 export function WhatsAppButton() {
-  const [phone, setPhone] = useState<string>('')
-
-  useEffect(() => {
-    fetch('/api/public/site-content')
-      .then(r => r.json())
-      .then((res: { success: boolean; data: SiteContent }) => {
-        if (res.success && res.data.whatsapp_number) {
-          setPhone(res.data.whatsapp_number.replace(/\D/g, ''))
-        }
-      })
-      .catch(() => {})
-  }, [])
-
-  const href = phone
-    ? `https://wa.me/${phone}?text=${encodeURIComponent("Hi! I'd like to place an order.")}`
-    : `https://wa.me/?text=${encodeURIComponent("Hi! I'd like to place an order.")}`
+  const href = `https://wa.me/${phone}?text=${encodeURIComponent("Hi! I'd like to place an order.")}`
 
   return (
     <a

@@ -14,6 +14,7 @@ import {
 import { useCartStore, cartTotalItems } from '@/store/cartStore'
 import { formatPrice } from '@/lib/utils'
 import type { MenuData, MenuItem, MenuVariant, MenuCategory, ComboDeal } from '@/types/menu'
+import { mockMenuData } from '@/lib/mock-data'
 
 // ─── Skeletons ────────────────────────────────────────────────────────────────
 
@@ -924,11 +925,11 @@ function ComboDealMarquee({ deals }: { deals: ComboDeal[] }) {
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function MenuPage() {
-  const [menuData, setMenuData] = useState<MenuData | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [menuData] = useState<MenuData>(mockMenuData)
+  const loading = false
+  const [error] = useState<string | null>(null)
   const [search, setSearch] = useState('')
-  const [activeSlug, setActiveSlug] = useState('')
+  const [activeSlug, setActiveSlug] = useState(mockMenuData.categories[0]?.slug ?? '')
   const [detailItem, setDetailItem] = useState<MenuItem | null>(null)
   const [mounted, setMounted] = useState(false)
   const cartItems = useCartStore((s) => s.items)
@@ -937,19 +938,6 @@ export default function MenuPage() {
   const observerRef = useRef<IntersectionObserver | null>(null)
 
   useEffect(() => { setMounted(true) }, [])
-
-  // Fetch menu
-  useEffect(() => {
-    fetch('/api/public/menu')
-      .then((r) => r.json())
-      .then((res: { success: boolean; data: MenuData }) => {
-        if (!res.success) throw new Error('Failed to load menu')
-        setMenuData(res.data)
-        setActiveSlug(res.data.categories[0]?.slug ?? '')
-      })
-      .catch(() => setError('Could not load menu. Please try again.'))
-      .finally(() => setLoading(false))
-  }, [])
 
   // Scroll to #deals on load if navigated from hero
   useEffect(() => {

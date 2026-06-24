@@ -12,22 +12,14 @@ const VIDEOS = [
   '/videos/fries-video.mp4',
 ]
 
-const DWELL_VH = 50
-const FADE     = 0.4
+const DWELL_VH  = 50
+const FADE      = 0.4
+const FRAME_FPS = 15  // frames extracted per second for scroll-driven clips
 
-// Lerp scales with scroll velocity so the scrub feels 1:1 during a fast fling
-// and silky-settling when the finger lifts.
-//   vel (px/ms)  lerp
-//   0            0.055  → gentle glide to rest
-//   1            ~0.22  → smooth follow
-//   3            ~0.53  → near-direct
-//   5+           0.65   → capped, feels instant
 const LERP_BASE  = 0.055
 const LERP_SCALE = 0.12
 const LERP_CAP   = 0.65
-
-// Only seek when the target differs by ≥ 1 frame at 30 fps.
-const SEEK_THR = 1 / 30
+const SEEK_THR   = 1 / 30
 
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
   { pre: 'Stacked &', accent: 'Bold'  },
@@ -45,38 +37,52 @@ function smoothstep(n: number) {
   return t * t * (3 - 2 * t)
 }
 
+// Draw bitmap covering the full canvas (CSS object-cover equivalent).
+function drawCover(ctx: CanvasRenderingContext2D, img: ImageBitmap, cw: number, ch: number) {
+  const scale = Math.max(cw / img.width, ch / img.height)
+  const w = img.width  * scale
+  const h = img.height * scale
+  ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h)
+}
+
 /**
- * Mobile hero: portrait videos scrubbed by scroll.
+ * Mobile hero — portrait videos for clips 1–3 are frame-extracted and rendered
+ * onto <canvas> elements for buttery-smooth scrubbing. Clip 0 autoplays.
  *
- * Zero-jank architecture:
- *  • Section geometry cached once (mount + resize) — never queried inside rAF.
- *  • Passive scroll listener writes scrollY + measures velocity into refs —
- *    the rAF loop reads refs only, no DOM queries.
- *  • Adaptive lerp: lerp = LERP_BASE + velocity * LERP_SCALE, capped at LERP_CAP.
- *    Fast scroll → near-direct; stopped → silky glide to rest.
- *  • Velocity decays per-frame (×0.88) to approximate momentum deceleration.
- *  • Off-screen layers (opacity < 0.01 and not in crossfade) are skipped entirely —
- *    no decoder wakeup for invisible clips.
- *  • `translateZ(0)` on every video + layer forces independent GPU compositor
- *    layers; opacity changes never touch the main thread.
+ * Zero-jank architecture (same as before, extended):
+ *  • Clip 0: autoPlay + loop, never scroll-scrubbed.
+ *  • Clips 1–3: ImageBitmap frames extracted once in background; rAF picks the
+ *    nearest frame and drawImage to canvas. No video.currentTime seek during
+ *    playback = no decoder stall.
+ *  • Fallback: while frames are still extracting the hidden <video> behind each
+ *    canvas is seeked as before (canvas is transparent until first draw).
+ *  • Adaptive lerp + velocity decay from original preserved.
  */
 export function MobileHero() {
   const sectionRef      = useRef<HTMLElement>(null)
+  // videoRefs[0] = autoplay hero; videoRefs[1..3] = fallback scroll videos
   const videoRefs       = useRef<(HTMLVideoElement | null)[]>([])
   const layerRefs       = useRef<(HTMLDivElement | null)[]>([])
+  // canvasRefs[0..2] correspond to VIDEOS[1..3]
+  const canvasRefs      = useRef<(HTMLCanvasElement | null)[]>([])
   const textOverlayRefs = useRef<(HTMLDivElement | null)[]>([])
   const textRef         = useRef<HTMLDivElement>(null)
   const scrollHintRef   = useRef<HTMLDivElement>(null)
   const rafRef          = useRef<number>(0)
 
+  // Extracted frames for clips 1–3 (index 0..2)
+  const framesRef      = useRef<(ImageBitmap[] | null)[]>([null, null, null])
+  const framesReadyRef = useRef([false, false, false])
+  const lastFrameIdx   = useRef([-1, -1, -1])
+
   // Section geometry — written on mount + resize, never inside rAF
   const sectionTopRef = useRef(0)
   const denomRef      = useRef(1)
 
-  // Scroll state — written by passive listener, read by rAF (zero layout force)
-  const targetPRef  = useRef(0)          // raw scroll → progress [0,1]
-  const smoothPRef  = useRef(0)          // lerped display progress
-  const velRef      = useRef(0)          // |px/ms|, drives adaptive lerp
+  // Scroll state — written by passive listener, read by rAF
+  const targetPRef  = useRef(0)
+  const smoothPRef  = useRef(0)
+  const velRef      = useRef(0)
   const prevScrollY = useRef(0)
   const prevScrollT = useRef(performance.now())
 
@@ -104,18 +110,86 @@ export function MobileHero() {
     } catch {}
   }, [reportProgress])
 
-  // Catch already-buffered first clip
   useEffect(() => {
     const v = videoRefs.current[0]
     if (v && v.readyState >= 2) markHeroReady()
   }, [markHeroReady])
 
-  // Keep every video paused — currentTime is fully scroll-driven
+  // Keep scroll-driven videos (1–3) paused; clip 0 autoplays via attribute
   useEffect(() => {
-    videoRefs.current.forEach(v => { if (v) v.pause() })
+    videoRefs.current.slice(1).forEach(v => { if (v) v.pause() })
   }, [])
 
-  // ── Section geometry (mount + resize) ────────────────────────────────────────
+  // ── Frame extraction for clips 1–3 ───────────────────────────────────────────
+  useEffect(() => {
+    const abortControllers: AbortController[] = []
+
+    async function extract(src: string, fi: number, signal: AbortSignal) {
+      const vid = document.createElement('video')
+      vid.src = src
+      vid.muted = true
+      vid.playsInline = true
+      vid.preload = 'auto'
+
+      await new Promise<void>((res, rej) => {
+        vid.addEventListener('loadedmetadata', () => res(), { once: true })
+        vid.addEventListener('error',          () => rej(),  { once: true })
+        vid.load()
+      })
+
+      if (signal.aborted) return
+      const duration = vid.duration
+      if (!isFinite(duration) || duration <= 0) return
+
+      const total = Math.ceil(duration * FRAME_FPS)
+      const frames: ImageBitmap[] = []
+
+      for (let f = 0; f < total; f++) {
+        if (signal.aborted) { frames.forEach(b => b.close()); return }
+        vid.currentTime = f / FRAME_FPS
+        await new Promise<void>(res => vid.addEventListener('seeked', () => res(), { once: true }))
+        if (signal.aborted) { frames.forEach(b => b.close()); return }
+        try {
+          frames.push(await createImageBitmap(vid))
+        } catch {}
+      }
+
+      if (signal.aborted) { frames.forEach(b => b.close()); return }
+      framesRef.current[fi]      = frames
+      framesReadyRef.current[fi] = true
+    }
+
+    VIDEOS.slice(1).forEach((src, fi) => {
+      const ac = new AbortController()
+      abortControllers.push(ac)
+      extract(src, fi, ac.signal).catch(() => {})
+    })
+
+    return () => {
+      abortControllers.forEach(ac => ac.abort())
+      framesRef.current.forEach(frames => frames?.forEach(b => b.close()))
+      framesRef.current      = [null, null, null]
+      framesReadyRef.current = [false, false, false]
+    }
+  }, [])
+
+  // ── Canvas sizing (physical pixels for sharp rendering) ───────────────────────
+  useEffect(() => {
+    const resize = () => {
+      const dpr = window.devicePixelRatio || 1
+      canvasRefs.current.forEach((canvas, fi) => {
+        if (!canvas) return
+        canvas.width  = Math.round(window.innerWidth  * dpr)
+        canvas.height = Math.round(window.innerHeight * dpr)
+        lastFrameIdx.current[fi] = -1  // force redraw after resize clears canvas
+      })
+    }
+    resize()
+    window.addEventListener('resize', resize, { passive: true })
+    return () => window.removeEventListener('resize', resize)
+  }, [])
+
+  // ── Section geometry (mount + resize) ─────────────────────────────────────────
   const calcGeometry = useCallback(() => {
     const el = sectionRef.current
     if (!el) return
@@ -129,28 +203,24 @@ export function MobileHero() {
     return () => window.removeEventListener('resize', calcGeometry)
   }, [calcGeometry])
 
-  // ── Passive scroll listener — velocity + progress, zero DOM reads in rAF ─────
+  // ── Passive scroll listener ────────────────────────────────────────────────────
   useEffect(() => {
     const onScroll = () => {
-      const now  = performance.now()
-      const dt   = now - prevScrollT.current
-      if (dt > 0) {
-        velRef.current = Math.abs((window.scrollY - prevScrollY.current) / dt)
-      }
+      const now = performance.now()
+      const dt  = now - prevScrollT.current
+      if (dt > 0) velRef.current = Math.abs((window.scrollY - prevScrollY.current) / dt)
       prevScrollY.current = window.scrollY
       prevScrollT.current = now
       targetPRef.current  = clamp01((window.scrollY - sectionTopRef.current) / denomRef.current)
     }
-    // Seed before first rAF fires
     prevScrollY.current = window.scrollY
     prevScrollT.current = performance.now()
     targetPRef.current  = clamp01((window.scrollY - sectionTopRef.current) / denomRef.current)
-
     window.addEventListener('scroll', onScroll, { passive: true })
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
-  // ── Opacity of clip i at scroll progress p ────────────────────────────────────
+  // ── Layer opacity at progress p ───────────────────────────────────────────────
   const layerOpacity = useCallback((i: number, p: number) => {
     if (i === 0) return 1
     const seg      = 1 / count
@@ -159,43 +229,52 @@ export function MobileHero() {
     return smoothstep((p - (boundary - halfFade)) / (halfFade * 2))
   }, [count])
 
-  // ── rAF loop — zero DOM reads, pure ref reads + style writes ─────────────────
+  // ── rAF loop ──────────────────────────────────────────────────────────────────
   const update = useCallback(() => {
-    // Adaptive lerp: scales with velocity so fast scroll ≈ direct, stopped = silky
     const lerp = Math.min(LERP_CAP, LERP_BASE + velRef.current * LERP_SCALE)
     smoothPRef.current += (targetPRef.current - smoothPRef.current) * lerp
-
-    // Velocity decays each frame to approximate momentum deceleration
     velRef.current *= 0.88
 
     const p   = smoothPRef.current
     const seg = 1 / count
 
-    // ── Scrub video currentTime ───────────────────────────────────────────────
-    for (let i = 0; i < count; i++) {
-      const v = videoRefs.current[i]
-      if (!v || !isFinite(v.duration) || v.duration <= 0) continue
-
-      // Skip off-screen layers that aren't in a crossfade transition
+    // Scrub clips 1–3 (clip 0 autoplays, no scrubbing)
+    for (let i = 1; i < count; i++) {
       const op  = layerOpacity(i, p)
       const nOp = i + 1 < count ? layerOpacity(i + 1, p) : 0
-      const inCrossfade = op > 0.01 || nOp > 0.01 || i === 0
-      if (!inCrossfade) continue
+      if (op <= 0.01 && nOp <= 0.01) continue
 
-      const t      = clamp01((p - i * seg) / seg)
-      const target = t * v.duration
-      if (Math.abs(v.currentTime - target) > SEEK_THR) {
-        v.currentTime = target
+      const t  = clamp01((p - i * seg) / seg)
+      const fi = i - 1  // frames/canvas index
+
+      if (framesReadyRef.current[fi] && framesRef.current[fi]) {
+        const frames   = framesRef.current[fi]!
+        const canvas   = canvasRefs.current[fi]
+        if (canvas) {
+          const frameIdx = Math.min(frames.length - 1, Math.floor(t * frames.length))
+          if (frameIdx !== lastFrameIdx.current[fi]) {
+            lastFrameIdx.current[fi] = frameIdx
+            const ctx = canvas.getContext('2d')
+            if (ctx) drawCover(ctx, frames[frameIdx], canvas.width, canvas.height)
+          }
+        }
+      } else {
+        // Fallback: seek video while frames are still extracting
+        const v = videoRefs.current[i]
+        if (v && isFinite(v.duration) && v.duration > 0) {
+          const target = t * v.duration
+          if (Math.abs(v.currentTime - target) > SEEK_THR) v.currentTime = target
+        }
       }
     }
 
-    // ── Layer opacities ───────────────────────────────────────────────────────
+    // Layer opacities
     for (let i = 0; i < count; i++) {
       const layer = layerRefs.current[i]
       if (layer) layer.style.opacity = String(layerOpacity(i, p))
     }
 
-    // ── Text badge visibility ─────────────────────────────────────────────────
+    // Text badge visibility
     for (let i = 0; i < 3; i++) {
       const overlay = textOverlayRefs.current[i]
       if (overlay) {
@@ -217,7 +296,7 @@ export function MobileHero() {
       }
     }
 
-    // ── Hero text fade ────────────────────────────────────────────────────────
+    // Hero text fade
     if (textRef.current) {
       const t = 1 - layerOpacity(1, p)
       textRef.current.style.opacity   = String(t)
@@ -244,42 +323,65 @@ export function MobileHero() {
       {/* sticky viewport */}
       <div className="sticky top-0 h-[100svh] overflow-hidden">
 
-        {/* ── Stacked portrait videos ─────────────────────────────────────── */}
-        {VIDEOS.map((src, i) => (
-          <div
-            key={src}
-            ref={el => { layerRefs.current[i] = el }}
-            className="absolute inset-0"
-            style={{
-              opacity:    i === 0 ? 1 : 0,
-              zIndex:     i,
-              willChange: 'opacity',
-              // translateZ promotes to its own GPU compositor layer so opacity
-              // changes never touch the main thread
-              transform:  'translateZ(0)',
-            }}
-            aria-hidden="true"
-          >
-            <video
-              ref={el => { videoRefs.current[i] = el }}
-              src={src}
-              muted
-              playsInline
-              preload="auto"
-              onLoadedData={i === 0 ? markHeroReady    : undefined}
-              onCanPlayThrough={i === 0 ? markHeroReady : undefined}
-              onError={i === 0 ? markHeroReady          : undefined}
-              onProgress={i === 0 ? onHeroProgress      : undefined}
-              className="absolute inset-0 w-full h-full object-cover"
-              style={{ transform: 'translateZ(0)' }}
-            />
-          </div>
-        ))}
+        {/* ── Clip 0: autoplay (no scroll scrubbing) ─────────────────────────── */}
+        <div
+          ref={el => { layerRefs.current[0] = el }}
+          className="absolute inset-0"
+          style={{ opacity: 1, zIndex: 0, willChange: 'opacity', transform: 'translateZ(0)' }}
+          aria-hidden="true"
+        >
+          <video
+            ref={el => { videoRefs.current[0] = el }}
+            src={VIDEOS[0]}
+            muted
+            autoPlay
+            loop
+            playsInline
+            preload="auto"
+            onLoadedData={markHeroReady}
+            onCanPlayThrough={markHeroReady}
+            onError={markHeroReady}
+            onProgress={onHeroProgress}
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ transform: 'translateZ(0)' }}
+          />
+        </div>
 
-        {/* ── Gradient veil ────────────────────────────────────────────────── */}
+        {/* ── Clips 1–3: canvas frame-scrubbing + video fallback ─────────────── */}
+        {VIDEOS.slice(1).map((src, fi) => {
+          const i = fi + 1
+          return (
+            <div
+              key={src}
+              ref={el => { layerRefs.current[i] = el }}
+              className="absolute inset-0"
+              style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
+              aria-hidden="true"
+            >
+              {/* Fallback video — visible while frames are being extracted */}
+              <video
+                ref={el => { videoRefs.current[i] = el }}
+                src={src}
+                muted
+                playsInline
+                preload="auto"
+                className="absolute inset-0 w-full h-full object-cover"
+                style={{ transform: 'translateZ(0)' }}
+              />
+              {/* Canvas sits on top; once frames are ready every draw covers video */}
+              <canvas
+                ref={el => { canvasRefs.current[fi] = el }}
+                className="absolute inset-0 w-full h-full"
+                style={{ transform: 'translateZ(0)' }}
+              />
+            </div>
+          )
+        })}
+
+        {/* ── Gradient veil ────────────────────────────────────────────────────── */}
         <div className="absolute inset-0 z-10 bg-gradient-to-b from-brand-bg/40 via-transparent to-brand-bg/80" />
 
-        {/* ── Text badges for clips 1–3 ────────────────────────────────────── */}
+        {/* ── Text badges for clips 1–3 ────────────────────────────────────────── */}
         {[0, 1, 2].map(i => (
           <div
             key={i}
@@ -320,7 +422,7 @@ export function MobileHero() {
           </div>
         ))}
 
-        {/* ── Hero text — fades into first transition ──────────────────────── */}
+        {/* ── Hero text — fades into first transition ──────────────────────────── */}
         <div
           ref={textRef}
           className="absolute inset-0 z-20 flex flex-col justify-end px-6 pb-20"
@@ -355,7 +457,7 @@ export function MobileHero() {
           </div>
         </div>
 
-        {/* ── Scroll hint ──────────────────────────────────────────────────── */}
+        {/* ── Scroll hint ──────────────────────────────────────────────────────── */}
         <div
           ref={scrollHintRef}
           className="absolute bottom-7 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2"

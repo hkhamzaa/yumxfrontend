@@ -3,8 +3,8 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { useSession, signOut } from 'next-auth/react'
 import { useCartStore, cartTotalItems } from '@/store/cartStore'
+import { mockSiteContent } from '@/lib/mock-data'
 import { Home, Utensils, Tag, Image as ImageIcon, Info, Mail, UserCircle } from 'lucide-react'
 
 function WhatsAppIcon({ size = 18 }: { size?: number }) {
@@ -31,28 +31,19 @@ function isNavActive(href: string, pathname: string): boolean {
   return pathname === href || pathname.startsWith(href + '/')
 }
 
+const whatsappPhone = mockSiteContent.whatsapp_number.replace(/\D/g, '')
+
 export function Navbar() {
   const [scrolled, setScrolled] = useState(false)
   const [mounted, setMounted] = useState(false)
-  const [whatsappPhone, setWhatsappPhone] = useState('')
   const cartItems = useCartStore((s) => s.items)
   const count = mounted ? cartTotalItems(cartItems) : 0
-  const { data: session } = useSession()
-  const firstName = session?.user?.name?.split(' ')[0]
   const pathname = usePathname()
 
   useEffect(() => {
     setMounted(true)
     const onScroll = () => setScrolled(window.scrollY > 60)
     window.addEventListener('scroll', onScroll, { passive: true })
-    fetch('/api/public/site-content')
-      .then(r => r.json())
-      .then((res: { success: boolean; data: { whatsapp_number?: string } }) => {
-        if (res.success && res.data.whatsapp_number) {
-          setWhatsappPhone(res.data.whatsapp_number.replace(/\D/g, ''))
-        }
-      })
-      .catch(() => {})
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
@@ -125,38 +116,8 @@ export function Navbar() {
             })}
           </nav>
 
-          {/* Right group — auth + cart + CTA */}
+          {/* Right group — cart + CTA */}
           <div className="flex items-center gap-2 md:gap-3 flex-shrink-0">
-
-            {/* Auth — desktop only */}
-            {mounted && (
-              session?.user ? (
-                <div className="hidden md:flex items-center gap-3">
-                  <Link
-                    href="/my-orders"
-                    className="font-body text-xs text-brand-muted hover:text-brand-accent transition-colors"
-                  >
-                    My Orders
-                  </Link>
-                  <span className="hidden lg:inline font-body text-xs text-brand-dim max-w-[80px] truncate">
-                    Hi, {firstName}
-                  </span>
-                  <button
-                    onClick={() => signOut({ callbackUrl: '/' })}
-                    className="font-body text-xs text-brand-dim hover:text-brand-accent transition-colors"
-                  >
-                    Sign out
-                  </button>
-                </div>
-              ) : (
-                <Link
-                  href="/login"
-                  className="hidden md:inline-flex font-body text-sm font-medium text-brand-muted hover:text-brand-accent transition-colors"
-                >
-                  Login
-                </Link>
-              )
-            )}
 
             {/* Cart icon */}
             <Link
@@ -225,11 +186,7 @@ export function Navbar() {
 
         {/* WhatsApp shortcut */}
         <a
-          href={
-            whatsappPhone
-              ? `https://wa.me/${whatsappPhone}?text=${encodeURIComponent("Hi! I'd like to place an order.")}`
-              : `https://wa.me/?text=${encodeURIComponent("Hi! I'd like to place an order.")}`
-          }
+          href={`https://wa.me/${whatsappPhone}?text=${encodeURIComponent("Hi! I'd like to place an order.")}`}
           target="_blank"
           rel="noopener noreferrer"
           aria-label="Chat on WhatsApp"
@@ -238,14 +195,14 @@ export function Navbar() {
           <WhatsAppIcon size={18} />
         </a>
 
-        {/* Auth shortcut — links to my-orders or login */}
+        {/* Login shortcut */}
         {mounted && (
           <Link
-            href={session?.user ? '/my-orders' : '/login'}
-            aria-label={session?.user ? 'My Orders' : 'Login'}
+            href="/login"
+            aria-label="Login"
             className={[
               'flex items-center rounded-full px-3 py-2.5 transition-all duration-300 ease-in-out',
-              (pathname === '/my-orders' || pathname === '/login')
+              pathname === '/login'
                 ? 'bg-brand-accent text-brand-bg'
                 : 'text-brand-muted hover:text-brand-text',
             ].join(' ')}

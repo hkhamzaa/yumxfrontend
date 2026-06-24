@@ -1,37 +1,29 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import { AdminShell } from '@/components/admin/AdminShell'
+import Link from 'next/link'
 
 export default function AdminShellLayout({ children }: { children: React.ReactNode }) {
-  const router = useRouter()
-  const [adminEmail, setAdminEmail] = useState<string | null>(null)
-
-  useEffect(() => {
-    fetch('/api/admin/auth/me')
-      .then((res) => {
-        if (!res.ok) throw new Error('Unauthorized')
-        return res.json()
-      })
-      .then((json) => {
-        if (!json.success || !json.data?.email) throw new Error('Unauthorized')
-        setAdminEmail(json.data.email)
-      })
-      .catch(() => router.replace('/admin/login'))
-  }, [router])
-
-  if (!adminEmail) {
-    return (
-      <div className="min-h-screen bg-brand-bg flex items-center justify-center">
-        <p className="font-body text-brand-muted">Loading admin…</p>
-      </div>
-    )
-  }
-
+  void children
   return (
-    <AdminShell adminEmail={adminEmail}>
-      {children}
-    </AdminShell>
+    <div className="min-h-screen bg-brand-bg flex flex-col items-center justify-center px-4 gap-6">
+      <div className="text-center max-w-sm">
+        <p className="font-body text-xs tracking-[0.3em] text-brand-accent uppercase font-semibold mb-3">
+          Admin Panel
+        </p>
+        <h1 className="font-display font-black text-4xl text-brand-text uppercase mb-4">
+          Under<br /><span className="text-brand-accent">Development</span>
+        </h1>
+        <p className="font-body text-sm text-brand-muted leading-relaxed mb-8">
+          The admin dashboard is temporarily unavailable while we work on the backend.
+          It will be back soon.
+        </p>
+        <Link
+          href="/"
+          className="font-body font-semibold text-sm px-8 py-4 rounded-squoval bg-brand-accent text-brand-bg hover:bg-white transition-colors"
+        >
+          Back to Site
+        </Link>
+      </div>
+    </div>
   )
 }

@@ -1,11 +1,10 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useParams } from 'next/navigation'
 import { Navbar } from '@/components/layout/Navbar'
 import { Footer } from '@/components/layout/Footer'
-import { OrderCountdown } from '@/components/OrderCountdown'
 import { formatPrice } from '@/lib/utils'
 
 interface OrderSummary {
@@ -19,28 +18,18 @@ interface OrderSummary {
   isLoggedIn: boolean
 }
 
-interface LiveStatus {
-  status: string
-  estimatedMinutes: number | null
-  readyAt: string | null
-}
-
 const ORDER_TYPE_LABELS: Record<string, string> = {
   DELIVERY: 'Delivery',
   PICKUP: 'Pickup',
   DINE_IN: 'Dine In',
 }
 
-const POLL_INTERVAL = 12_000 // 12 s
-
 export default function OrderConfirmationPage() {
   const { orderNumber } = useParams<{ orderNumber: string }>()
   const [summary, setSummary] = useState<OrderSummary | null>(null)
-  const [live, setLive] = useState<LiveStatus | null>(null)
   const [mounted, setMounted] = useState(false)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Load sessionStorage on mount
+  // Load order summary from sessionStorage (set by CartPageClient on submit)
   useEffect(() => {
     setMounted(true)
     try {
@@ -51,33 +40,6 @@ export default function OrderConfirmationPage() {
       }
     } catch { /* sessionStorage unavailable */ }
   }, [orderNumber])
-
-  // Poll for readyAt
-  async function fetchLive() {
-    try {
-      const res = await fetch(`/api/public/orders/status/${orderNumber}`)
-      const json = await res.json() as { success: boolean; data?: LiveStatus }
-      if (json.success && json.data) setLive(json.data)
-    } catch { /* ignore */ }
-  }
-
-  useEffect(() => {
-    fetchLive()
-    pollRef.current = setInterval(fetchLive, POLL_INTERVAL)
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orderNumber])
-
-  // Stop polling once readyAt is available
-  useEffect(() => {
-    if (live?.readyAt && pollRef.current) {
-      clearInterval(pollRef.current)
-      pollRef.current = null
-    }
-  }, [live?.readyAt])
-
-  const showCountdown = live?.readyAt && live?.estimatedMinutes
-  const awaitingConfirm = live && !live.readyAt && live.status === 'PENDING'
 
   return (
     <>
@@ -106,29 +68,6 @@ export default function OrderConfirmationPage() {
               <p className="font-body text-brand-muted mt-4 mb-6 leading-relaxed">
                 Hey {summary.name.split(' ')[0]}, your order is in!
               </p>
-
-              {/* Countdown / status block */}
-              <div className="bg-brand-surface rounded-2xl border border-brand-border p-6 mb-5">
-                {showCountdown ? (
-                  <OrderCountdown
-                    readyAt={live.readyAt!}
-                    estimatedMinutes={live.estimatedMinutes!}
-                  />
-                ) : awaitingConfirm ? (
-                  <div className="flex flex-col items-center gap-3 py-2">
-                    <span className="w-8 h-8 border-2 border-brand-accent/40 border-t-brand-accent rounded-full animate-spin" />
-                    <p className="font-body text-sm text-brand-muted leading-relaxed">
-                      Your order is being reviewed —{' '}
-                      <span className="text-brand-text font-medium">estimated time will appear shortly.</span>
-                    </p>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center gap-3 py-2">
-                    <span className="text-3xl">⏳</span>
-                    <p className="font-body text-sm text-brand-muted">Checking order status…</p>
-                  </div>
-                )}
-              </div>
 
               {/* Order details card */}
               <div className="bg-brand-surface rounded-2xl border border-brand-border p-5 text-left mb-5">
@@ -161,18 +100,12 @@ export default function OrderConfirmationPage() {
                 </div>
               </div>
 
-              {/* Soft login prompt for guests */}
-              {!summary.isLoggedIn && (
-                <div className="bg-brand-surface rounded-2xl border border-brand-border p-5 mb-5 text-left">
-                  <p className="font-body text-sm text-brand-muted leading-relaxed">
-                    Want to track this and future orders?{' '}
-                    <Link href="/login" className="text-brand-accent font-semibold hover:underline">Login</Link>
-                    {' '}or{' '}
-                    <Link href="/login?mode=signup" className="text-brand-accent font-semibold hover:underline">Sign up</Link>
-                    {' '}— free and takes 10 seconds.
-                  </p>
-                </div>
-              )}
+              <div className="bg-brand-surface rounded-2xl border border-brand-border p-4 mb-5">
+                <p className="font-body text-sm text-brand-muted flex items-center justify-center gap-2">
+                  <span className="inline-block w-4 h-4 border-2 border-brand-accent/40 border-t-brand-accent rounded-full animate-spin flex-none" />
+                  We&apos;re preparing your order — our team will be in touch shortly.
+                </p>
+              </div>
             </>
           ) : (
             <p className="font-body text-brand-muted mt-4 mb-6 leading-relaxed">
@@ -182,12 +115,6 @@ export default function OrderConfirmationPage() {
           )}
 
           <div className="flex flex-col sm:flex-row gap-3 justify-center">
-            {summary?.isLoggedIn && (
-              <Link href="/my-orders"
-                className="font-body font-semibold text-sm px-8 py-4 rounded-full border border-brand-border text-brand-muted hover:border-brand-accent hover:text-brand-accent transition-colors">
-                My Orders
-              </Link>
-            )}
             <Link href="/menu"
               className="font-body font-semibold text-sm px-8 py-4 rounded-squoval bg-brand-accent text-brand-bg hover:bg-white transition-colors">
               Order More
