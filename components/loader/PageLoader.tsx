@@ -5,10 +5,12 @@ import { useLoadingStatus } from './LoadingProvider'
 
 // Crossfade duration when lifting the loader.
 const FADE_MS = 500
-// Keep the loader on screen at least this long so it never flashes by.
-const MIN_DISPLAY_MS = 600
+// Keep the loader on screen at least this long — extended so background frame
+// extraction for the scroll-driven hero clips has time to run before the user
+// can interact with the page (current baseline + 10 s).
+const MIN_DISPLAY_MS = 10600
 // Hard ceiling: dismiss even if an asset silently stalls, so we never hang.
-const SAFETY_TIMEOUT_MS = 12000
+const SAFETY_TIMEOUT_MS = 25000
 
 export function PageLoader() {
   const { allReady, progress } = useLoadingStatus()
