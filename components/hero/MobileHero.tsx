@@ -64,7 +64,6 @@ export function MobileHero() {
   const rafRef          = useRef<number>(0)
 
   const framesRef      = useRef<(ImageBitmap[] | null)[]>([null, null, null])
-  const framesReadyRef = useRef([false, false, false])
   const lastFrameIdx   = useRef([-1, -1, -1])
   // Set as soon as duration is known — keeps the t→frame mapping stable
   // while extraction is still in progress (prevents index jumps).
@@ -114,7 +113,6 @@ export function MobileHero() {
       const bmp = await createImageBitmap(vid)
       frameTotalsRef.current[fi] = Math.ceil(duration * FRAME_FPS)
       framesRef.current[fi] = [bmp]
-      framesReadyRef.current[fi] = true
     } catch {}
 
     // Release the video element so the browser can free the download buffer
@@ -310,23 +308,25 @@ export function MobileHero() {
       const t  = clamp01((p - i * seg) / seg)
       const fi = i - 1
 
-      if (framesReadyRef.current[fi] && framesRef.current[fi]) {
-        const frames = framesRef.current[fi]!
-        const canvas = canvasRefs.current[fi]
-        if (canvas) {
-          // frameTotals is set as soon as duration is known so the mapping is
-          // stable while the array grows. Clamping to frames.length-1 shows
-          // the last ready frame if the target frame isn't extracted yet.
-          const total    = frameTotalsRef.current[fi] || frames.length
-          const frameIdx = Math.min(frames.length - 1, Math.floor(t * total))
-          if (frameIdx !== lastFrameIdx.current[fi]) {
-            lastFrameIdx.current[fi] = frameIdx
-            const ctx = canvas.getContext('2d')
-            if (ctx) drawCover(ctx, frames[frameIdx], canvas.width, canvas.height)
-          }
+      const frames = framesRef.current[fi]
+      const canvas = canvasRefs.current[fi]
+      const total  = frameTotalsRef.current[fi]
+      const frameIdx = total > 0 ? Math.floor(t * total) : -1
+
+      if (frames && canvas && frameIdx >= 0 && frameIdx < frames.length) {
+        // Exact extracted frame is available — draw it to canvas (covers video)
+        if (frameIdx !== lastFrameIdx.current[fi]) {
+          lastFrameIdx.current[fi] = frameIdx
+          const ctx = canvas.getContext('2d')
+          if (ctx) drawCover(ctx, frames[frameIdx], canvas.width, canvas.height)
         }
       } else {
-        // Fallback: seek the preloaded video element while frames are extracting
+        // Frame not yet extracted — clear canvas so video shows through, then seek it
+        if (canvas && lastFrameIdx.current[fi] !== -2) {
+          lastFrameIdx.current[fi] = -2
+          const ctx = canvas.getContext('2d')
+          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
+        }
         const v = videoRefs.current[i]
         if (v && isFinite(v.duration) && v.duration > 0) {
           const target = t * v.duration
@@ -419,11 +419,11 @@ export function MobileHero() {
               style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
               aria-hidden="true"
             >
-              {/* Fallback video — loaded after hero is ready via startFrameExtraction */}
+              {/* Fallback video — metadata preloads immediately so duration is ready for seeking */}
               <video
                 ref={el => { videoRefs.current[i] = el }}
                 src={src}
-                muted playsInline preload="none"
+                muted playsInline preload="metadata"
                 className="absolute inset-0 w-full h-full object-cover"
                 style={{ transform: 'translateZ(0)' }}
               />
