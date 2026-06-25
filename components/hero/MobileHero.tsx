@@ -14,11 +14,11 @@ const VIDEOS = [
 
 const DWELL_VH  = 50
 const FADE      = 0.4
-const FRAME_FPS = 10
+const FRAME_FPS = 15
 
-const LERP_BASE  = 0.055
-const LERP_SCALE = 0.12
-const LERP_CAP   = 0.65
+const LERP_BASE  = 0.08
+const LERP_SCALE = 0.18
+const LERP_CAP   = 0.72
 const SEEK_THR   = 1 / 30
 
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
@@ -69,7 +69,8 @@ export function MobileHero() {
   // while extraction is still in progress (prevents index jumps).
   const frameTotalsRef = useRef([0, 0, 0])
 
-  const extractAbortCtrlRef = useRef<AbortController | null>(null)
+  const extractAbortCtrlRef   = useRef<AbortController | null>(null)
+  const extractionStartedRef  = useRef(false)
 
   const sectionTopRef = useRef(0)
   const denomRef      = useRef(1)
@@ -175,29 +176,26 @@ export function MobileHero() {
   }, [])
 
   const startFrameExtraction = useCallback(async () => {
+    if (extractionStartedRef.current) return
+    extractionStartedRef.current = true
     const ac = new AbortController()
     extractAbortCtrlRef.current = ac
 
-    // Load all three fallback video elements immediately so the rAF video-seek
-    // fallback works right away while frames are being extracted.
-    videoRefs.current.slice(1).forEach(v => {
-      if (v) { v.preload = 'auto'; v.load() }
-    })
-
-    // ── Phase 1: all 3 first frames in PARALLEL (~300 ms) ────────────────────
-    // Each call only needs loadeddata + one GPU copy — no seek, minimal CPU.
+    // ── Phase 1: all 3 first frames in PARALLEL ───────────────────────────────
+    // Scroll videos already have preload="auto" so data is in cache — fast.
     await Promise.all(
       VIDEOS.slice(1).map((src, fi) =>
         captureFirstFrame(src, fi, ac.signal).catch(() => {}),
       ),
     )
 
-    // ── Phase 2: remaining frames SEQUENTIALLY + per-frame yield ─────────────
-    // One video decoder at a time → no CPU overload, rAF stays smooth.
-    for (let fi = 0; fi < 3; fi++) {
-      if (ac.signal.aborted) break
-      await extractRemainingFrames(VIDEOS[fi + 1], fi, ac.signal).catch(() => {})
-    }
+    // ── Phase 2: all 3 clips in PARALLEL with per-frame yield ────────────────
+    // Parallel extraction cuts total extraction time by ~3× vs sequential.
+    await Promise.all(
+      VIDEOS.slice(1).map((src, fi) =>
+        extractRemainingFrames(src, fi, ac.signal).catch(() => {}),
+      ),
+    )
   }, [captureFirstFrame, extractRemainingFrames])
 
   // Close all bitmaps when the component unmounts
@@ -234,6 +232,13 @@ export function MobileHero() {
   useEffect(() => {
     videoRefs.current.slice(1).forEach(v => { if (v) v.pause() })
   }, [])
+
+  // Fallback: if hero isn't ready within 1.2 s, start extraction anyway.
+  // Scroll videos are already buffering (preload="auto"), so this is fast.
+  useEffect(() => {
+    const t = setTimeout(() => startFrameExtraction(), 1200)
+    return () => clearTimeout(t)
+  }, [startFrameExtraction])
 
   // ── Canvas sizing ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -419,11 +424,11 @@ export function MobileHero() {
               style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
               aria-hidden="true"
             >
-              {/* Fallback video — metadata preloads immediately so duration is ready for seeking */}
+              {/* Fallback video — preload="auto" buffers data so seeking works immediately */}
               <video
                 ref={el => { videoRefs.current[i] = el }}
                 src={src}
-                muted playsInline preload="metadata"
+                muted playsInline preload="auto"
                 className="absolute inset-0 w-full h-full object-cover"
                 style={{ transform: 'translateZ(0)' }}
               />
