@@ -1,10 +1,10 @@
 'use client'
 
-import { useEffect, useRef, useCallback, useState } from 'react'
+import { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import Link from 'next/link'
 import SplitText from '@/components/ui/SplitText'
 import { useLoadingReporter } from '@/components/loader/LoadingProvider'
-import { HERO_CLIPS, HERO_TOTAL_FRAMES } from '@/lib/heroFrames'
+import { HERO_CLIPS, frameUrl } from '@/lib/heroFrames'
 
 // Autoplay clip that plays first (clip 0). The three scroll-scrubbed clips
 // (burger → wings → fries) are pre-rendered image frames served from Cloudinary.
@@ -19,12 +19,47 @@ const LERP_BASE  = 0.08
 const LERP_SCALE = 0.18
 const LERP_CAP   = 0.72
 
-// Concurrent image downloads per clip. HTTP/2 multiplexes, but a small pool
-// keeps memory/CPU gentle on low-end phones and preserves burger-first order.
-const POOL_SIZE = 8
-// Cap canvas backing-store density: frames are 720px wide, so rendering past
-// ~2× DPR just burns fill-rate/GPU memory for no visible gain.
-const DPR_CAP = 2
+// Concurrent image downloads. HTTP/2 multiplexes, but a small pool keeps
+// memory/CPU gentle on low-end phones and preserves burger-first ordering.
+const POOL_SIZE = 6
+
+/**
+ * Device tier — picks how many frames to load and how heavy each one is, so the
+ * weakest phone on the slowest link still loads fast and scrubs smoothly:
+ *   step      = frame subsample (higher = fewer frames = less data + less decode)
+ *   transform = Cloudinary delivery (smaller width = far cheaper to decode/draw)
+ *   dpr       = canvas backing-store density cap (lower = less GPU fill = battery)
+ */
+type Tier = { step: number; transform: string; dpr: number }
+const TIER_HIGH: Tier = { step: 1, transform: 'f_auto,q_auto:eco',        dpr: 2    }
+const TIER_MID:  Tier = { step: 2, transform: 'f_auto,q_auto:eco,w_560',  dpr: 1.5  }
+const TIER_LOW:  Tier = { step: 3, transform: 'f_auto,q_auto:low,w_420',  dpr: 1.25 }
+
+function detectTier(): Tier {
+  if (typeof navigator === 'undefined') return TIER_HIGH
+  const nav = navigator as Navigator & {
+    connection?: { effectiveType?: string; saveData?: boolean }
+    deviceMemory?: number
+  }
+  const conn = nav.connection || {}
+  const et   = conn.effectiveType || '4g'
+  const save = !!conn.saveData
+  const mem  = nav.deviceMemory ?? 4
+
+  if (save || mem <= 2 || et === '2g' || et === 'slow-2g') return TIER_LOW
+  if (mem <= 4 || et === '3g')                              return TIER_MID
+  return TIER_HIGH
+}
+
+/** Pick every `step`-th item, always keeping the first and last frame. */
+function subsample<T>(arr: T[], step: number): T[] {
+  if (step <= 1) return arr
+  const out: T[] = []
+  for (let i = 0; i < arr.length; i += step) out.push(arr[i])
+  const last = arr[arr.length - 1]
+  if (out[out.length - 1] !== last) out.push(last)
+  return out
+}
 
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
   { pre: 'Stacked &', accent: 'Bold'  },
@@ -59,18 +94,33 @@ export function MobileHero() {
   const videoRef        = useRef<HTMLVideoElement | null>(null)
   const layerRefs       = useRef<(HTMLDivElement | null)[]>([])
   const canvasRefs      = useRef<(HTMLCanvasElement | null)[]>([])
+  const ctxRefs         = useRef<(CanvasRenderingContext2D | null)[]>([])
   const textOverlayRefs = useRef<(HTMLDivElement | null)[]>([])
   const textRef         = useRef<HTMLDivElement>(null)
   const scrollHintRef   = useRef<HTMLDivElement>(null)
   const rafRef          = useRef<number>(0)
 
-  // Per-clip image elements + load flags. Images hold compressed bytes (cheap);
-  // the browser decodes on draw and LRU-evicts — ideal for sequential scrubbing,
-  // so we never pin hundreds of decoded frames in memory.
-  const imagesRef    = useRef<(HTMLImageElement | null)[][]>(HERO_CLIPS.map(c => c.frames.map(() => null)))
-  const loadedRef    = useRef<boolean[][]>(HERO_CLIPS.map(c => c.frames.map(() => false)))
+  // Device tier is stable for the component's life. Computed in a state
+  // initializer so it's ready synchronously for canvas sizing; it affects only
+  // imperative loading/drawing, never the SSR markup, so no hydration mismatch.
+  const [tier] = useState<Tier>(detectTier)
+
+  // Per-clip frame URLs after subsampling for this tier.
+  const clipFrames = useMemo(
+    () => HERO_CLIPS.map(c => subsample(c.ids, tier.step).map(id => frameUrl(id, tier.transform))),
+    [tier]
+  )
+  const totalFrames = useMemo(
+    () => clipFrames.reduce((s, f) => s + f.length, 0),
+    [clipFrames]
+  )
+
+  // Image elements + load flags (compressed in memory; decoded on draw and
+  // LRU-evicted by the browser — no pinning of hundreds of decoded frames).
+  const imagesRef    = useRef<(HTMLImageElement | null)[][]>([])
+  const loadedRef    = useRef<boolean[][]>([])
+  const frameTotals  = useRef<number[]>(clipFrames.map(f => f.length))
   const lastFrameIdx = useRef<number[]>(HERO_CLIPS.map(() => -1))
-  const frameTotals  = useRef<number[]>(HERO_CLIPS.map(c => c.frames.length))
 
   const sectionTopRef = useRef(0)
   const denomRef      = useRef(1)
@@ -80,6 +130,8 @@ export function MobileHero() {
   const velRef      = useRef(0)
   const prevScrollY = useRef(0)
   const prevScrollT = useRef(performance.now())
+
+  const visibleRef = useRef(true)
 
   const textAnimatedRef = useRef([false, false, false])
   const [textTriggered, setTextTriggered] = useState([false, false, false])
@@ -95,6 +147,12 @@ export function MobileHero() {
     let alive = true
     let loaded = 0
 
+    // (Re)initialise per-clip buffers for the chosen tier.
+    imagesRef.current   = clipFrames.map(f => f.map(() => null))
+    loadedRef.current   = clipFrames.map(f => f.map(() => false))
+    frameTotals.current = clipFrames.map(f => f.length)
+    lastFrameIdx.current = clipFrames.map(() => -1)
+
     const maybeReady = () => {
       if (heroReadyRef.current) return
       if (framesDoneRef.current && videoReadyRef.current) {
@@ -105,10 +163,10 @@ export function MobileHero() {
 
     const onOne = () => {
       loaded++
-      // Reserve a sliver of the bar for the autoplay video so the bar only
-      // hits 100% once everything (frames + video) is truly ready.
-      reportProgress('hero', (loaded / HERO_TOTAL_FRAMES) * 0.97 + (videoReadyRef.current ? 0.03 : 0))
-      if (loaded >= HERO_TOTAL_FRAMES) { framesDoneRef.current = true; maybeReady() }
+      // Reserve a sliver of the bar for the autoplay video so it only reaches
+      // 100% once everything (frames + video) is truly ready.
+      reportProgress('hero', (loaded / totalFrames) * 0.97 + (videoReadyRef.current ? 0.03 : 0))
+      if (loaded >= totalFrames) { framesDoneRef.current = true; maybeReady() }
     }
 
     const loadFrame = (ci: number, fi: number) => new Promise<void>(resolve => {
@@ -123,18 +181,14 @@ export function MobileHero() {
       }
       img.onload  = done
       img.onerror = done // count errors too, so the loader can never hang
-      img.src = HERO_CLIPS[ci].frames[fi]
+      img.src = clipFrames[ci][fi]
     })
 
-    // Pooled, in-order load of a single clip's frames.
     const loadClip = async (ci: number) => {
-      const n = HERO_CLIPS[ci].frames.length
+      const n = clipFrames[ci].length
       let next = 0
       const worker = async () => {
-        while (alive && next < n) {
-          const fi = next++
-          await loadFrame(ci, fi)
-        }
+        while (alive && next < n) { const fi = next++; await loadFrame(ci, fi) }
       }
       await Promise.all(Array.from({ length: Math.min(POOL_SIZE, n) }, worker))
     }
@@ -148,9 +202,9 @@ export function MobileHero() {
     })()
 
     return () => { alive = false }
-  }, [reportProgress, reportReady])
+  }, [clipFrames, totalFrames, reportProgress, reportReady])
 
-  // Expose a stable callback for the autoplay video's ready/error events.
+  // Autoplay video readiness (folds into the same 'hero' loader group).
   const markVideoReady = useCallback(() => {
     if (videoReadyRef.current) return
     videoReadyRef.current = true
@@ -166,7 +220,7 @@ export function MobileHero() {
     if (!v || !isFinite(v.duration) || v.duration <= 0) return
     try {
       const end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0
-      if (end / v.duration >= 0.25) markVideoReady() // enough buffered to loop cleanly
+      if (end / v.duration >= 0.25) markVideoReady()
     } catch {}
   }, [markVideoReady])
 
@@ -178,18 +232,20 @@ export function MobileHero() {
   // ── Canvas sizing ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const resize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
+      const dpr = Math.min(window.devicePixelRatio || 1, tier.dpr)
       canvasRefs.current.forEach((canvas, fi) => {
         if (!canvas) return
         canvas.width  = Math.round(window.innerWidth  * dpr)
         canvas.height = Math.round(window.innerHeight * dpr)
+        const ctx = canvas.getContext('2d')
+        if (ctx) { ctx.imageSmoothingQuality = 'low'; ctxRefs.current[fi] = ctx }
         lastFrameIdx.current[fi] = -1 // force redraw at new size
       })
     }
     resize()
     window.addEventListener('resize', resize, { passive: true })
     return () => window.removeEventListener('resize', resize)
-  }, [])
+  }, [tier])
 
   // ── Section geometry ──────────────────────────────────────────────────────────
   const calcGeometry = useCallback(() => {
@@ -231,11 +287,12 @@ export function MobileHero() {
     return smoothstep((p - (boundary - halfFade)) / (halfFade * 2))
   }, [])
 
-  // Nearest already-loaded frame to `idx` (used only if rendering ever races the
-  // download; after the loader lifts, every frame is present and idx is exact).
+  // Nearest already-loaded frame to `idx` (only matters if rendering ever races
+  // the download; after the loader lifts every frame is present and idx is exact).
   const pickFrame = useCallback((ci: number, idx: number): HTMLImageElement | null => {
     const imgs = imagesRef.current[ci]
     const ld   = loadedRef.current[ci]
+    if (!imgs || !ld) return null
     if (ld[idx]) return imgs[idx]
     for (let d = 1; d < imgs.length; d++) {
       if (idx - d >= 0 && ld[idx - d]) return imgs[idx - d]
@@ -244,8 +301,10 @@ export function MobileHero() {
     return null
   }, [])
 
-  // ── rAF loop ──────────────────────────────────────────────────────────────────
+  // ── rAF loop (self-suspends when the hero is off-screen / tab hidden) ───────────
   const update = useCallback(() => {
+    if (!visibleRef.current) { rafRef.current = 0; return }
+
     const lerp = Math.min(LERP_CAP, LERP_BASE + velRef.current * LERP_SCALE)
     smoothPRef.current += (targetPRef.current - smoothPRef.current) * lerp
     velRef.current *= 0.88
@@ -261,18 +320,18 @@ export function MobileHero() {
       const t  = clamp01((p - i * seg) / seg)
       const fi = i - 1
 
-      const canvas = canvasRefs.current[fi]
-      const total  = frameTotals.current[fi]
-      if (!canvas || total <= 0) continue
+      const total = frameTotals.current[fi]
+      if (total <= 0) continue
 
       const frameIdx = Math.min(total - 1, Math.floor(t * total))
       if (frameIdx === lastFrameIdx.current[fi]) continue
 
       const img = pickFrame(fi, frameIdx)
-      if (img) {
+      const ctx = ctxRefs.current[fi]
+      const canvas = canvasRefs.current[fi]
+      if (img && ctx && canvas) {
         lastFrameIdx.current[fi] = frameIdx
-        const ctx = canvas.getContext('2d')
-        if (ctx) drawCover(ctx, img, canvas.width, canvas.height)
+        drawCover(ctx, img, canvas.width, canvas.height)
       }
     }
 
@@ -315,10 +374,43 @@ export function MobileHero() {
     rafRef.current = requestAnimationFrame(update)
   }, [layerOpacity, pickFrame])
 
-  useEffect(() => {
-    rafRef.current = requestAnimationFrame(update)
-    return () => cancelAnimationFrame(rafRef.current)
+  const ensureLoop = useCallback(() => {
+    if (!rafRef.current) rafRef.current = requestAnimationFrame(update)
   }, [update])
+
+  useEffect(() => {
+    ensureLoop()
+    return () => { cancelAnimationFrame(rafRef.current); rafRef.current = 0 }
+  }, [ensureLoop])
+
+  // ── Battery: suspend rendering + autoplay when off-screen or tab hidden ─────────
+  useEffect(() => {
+    const el = sectionRef.current
+    if (!el) return
+    const io = new IntersectionObserver(([entry]) => {
+      visibleRef.current = entry.isIntersecting
+      const v = videoRef.current
+      if (entry.isIntersecting) {
+        if (!document.hidden) { v?.play().catch(() => {}); ensureLoop() }
+      } else {
+        v?.pause()
+      }
+    }, { threshold: 0 })
+    io.observe(el)
+
+    const onVis = () => {
+      const v = videoRef.current
+      if (document.hidden) {
+        v?.pause()
+        cancelAnimationFrame(rafRef.current); rafRef.current = 0
+      } else if (visibleRef.current) {
+        v?.play().catch(() => {}); ensureLoop()
+      }
+    }
+    document.addEventListener('visibilitychange', onVis)
+
+    return () => { io.disconnect(); document.removeEventListener('visibilitychange', onVis) }
+  }, [ensureLoop])
 
   return (
     <section

@@ -8,10 +8,14 @@ const FADE_MS = 500
 // Minimum on-screen time so the intro animation reads — real readiness (all hero
 // frames + fonts loaded) is what actually drives dismissal now, not a timer.
 const MIN_DISPLAY_MS = 600
-// Hard ceiling: dismiss even if an asset silently stalls, so we never hang.
-// Frames keep streaming in after this; the canvas falls back to the nearest
-// loaded frame, so an early dismiss degrades gracefully rather than breaking.
-const SAFETY_TIMEOUT_MS = 30000
+// Stall guard: the loader waits as long as assets keep arriving (so even a slow
+// phone on a weak link sees the whole hero before reveal). It only gives up if
+// progress flatlines for this long — i.e. something is genuinely stuck, not slow.
+const STALL_TIMEOUT_MS = 12000
+// Absolute ceiling — last-resort dismiss so a hard hang can never trap the user.
+// Frames keep streaming after reveal; the canvas falls back to the nearest
+// loaded frame, so a late dismiss degrades gracefully rather than breaking.
+const HARD_TIMEOUT_MS = 120000
 
 export function PageLoader() {
   const { allReady, progress } = useLoadingStatus()
@@ -21,6 +25,9 @@ export function PageLoader() {
   const [shown, setShown] = useState(0)
   const mountedAt = useRef(Date.now())
   const dismissed = useRef(false)
+  // Timestamp of the last forward progress — drives the stall guard.
+  const lastAdvanceAt = useRef(Date.now())
+  const lastProgress  = useRef(0)
 
   // Skip the loader entirely on repeat visits within the session.
   useEffect(() => {
@@ -38,13 +45,19 @@ export function PageLoader() {
     return () => { document.body.style.overflow = prev }
   }, [visible])
 
-  // Mirror real asset progress onto the bar (never moving backwards).
+  // Mirror real asset progress onto the bar (never moving backwards) and record
+  // when it last moved, so the stall guard can tell "slow" from "stuck".
   useEffect(() => {
     setShown((prev) => Math.max(prev, Math.round(progress * 100)))
+    if (progress > lastProgress.current) {
+      lastProgress.current = progress
+      lastAdvanceAt.current = Date.now()
+    }
   }, [progress])
 
-  // Dismiss once every asset is ready (after a minimum on-screen time), with a
-  // hard safety fallback so a stalled asset can never trap the user behind it.
+  // Dismiss when everything is ready (after a minimum on-screen time). Otherwise
+  // keep waiting while assets stream in — only bail out if progress flatlines
+  // (stall guard) or the absolute ceiling is hit.
   useEffect(() => {
     if (dismissed.current) return
 
@@ -59,15 +72,20 @@ export function PageLoader() {
       }, FADE_MS)
     }
 
-    const safety = setTimeout(dismiss, SAFETY_TIMEOUT_MS)
-
     if (allReady) {
       const wait = Math.max(0, MIN_DISPLAY_MS - (Date.now() - mountedAt.current))
       const ready = setTimeout(dismiss, wait)
-      return () => { clearTimeout(ready); clearTimeout(safety) }
+      return () => clearTimeout(ready)
     }
 
-    return () => clearTimeout(safety)
+    // Poll once a second: bail only if progress has been frozen too long, or the
+    // hard ceiling is reached. A still-advancing download keeps the loader up.
+    const poll = setInterval(() => {
+      const now = Date.now()
+      if (now - lastAdvanceAt.current > STALL_TIMEOUT_MS) dismiss()
+      else if (now - mountedAt.current > HARD_TIMEOUT_MS) dismiss()
+    }, 1000)
+    return () => clearInterval(poll)
   }, [allReady])
 
   if (!visible) return null

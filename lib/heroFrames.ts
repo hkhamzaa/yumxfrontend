@@ -3,10 +3,16 @@
 // Order is frame_001 … frame_N per clip. Regenerate if frames change.
 
 const CLOUD = 'duj3atvzj'
-// f_auto → AVIF/WebP per browser, q_auto:eco → leanest bytes for low bandwidth.
-const TRANSFORM = 'f_auto,q_auto:eco'
-const url = (id: string) =>
-  `https://res.cloudinary.com/${CLOUD}/image/upload/${TRANSFORM}/${id}`
+const BASE = `https://res.cloudinary.com/${CLOUD}/image/upload`
+
+/**
+ * Build a delivery URL for one frame with a runtime Cloudinary transform, e.g.
+ * `frameUrl(id, 'f_auto,q_auto:eco,w_540')`. The transform is chosen per device
+ * tier so low-end phones get smaller, cheaper-to-decode frames.
+ */
+export function frameUrl(id: string, transform: string): string {
+  return `${BASE}/${transform}/${id}`
+}
 
 const BURGER_IDS = [
   'ezgif-frame-001_bxfnua',
@@ -409,15 +415,13 @@ const FRIES_IDS = [
 export interface HeroClip {
   /** Clip label, used only for keys/debugging. */
   name: string
-  /** Ordered, fully-qualified Cloudinary frame URLs (frame 0 → last). */
-  frames: string[]
+  /** Ordered Cloudinary public IDs (frame 0 → last). */
+  ids: string[]
 }
 
 /** Scroll-driven clips in reveal order: burger → wings → fries. */
 export const HERO_CLIPS: HeroClip[] = [
-  { name: 'burger', frames: BURGER_IDS.map(url) },
-  { name: 'wings',  frames: WINGS_IDS.map(url) },
-  { name: 'fries',  frames: FRIES_IDS.map(url) },
+  { name: 'burger', ids: BURGER_IDS },
+  { name: 'wings',  ids: WINGS_IDS },
+  { name: 'fries',  ids: FRIES_IDS },
 ]
-
-export const HERO_TOTAL_FRAMES = HERO_CLIPS.reduce((s, c) => s + c.frames.length, 0)
