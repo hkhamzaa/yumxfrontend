@@ -5,12 +5,13 @@ import { useLoadingStatus } from './LoadingProvider'
 
 // Crossfade duration when lifting the loader.
 const FADE_MS = 500
-// Keep the loader on screen at least this long — extended so background frame
-// extraction for the scroll-driven hero clips has time to run before the user
-// can interact with the page (current baseline + 10 s).
-const MIN_DISPLAY_MS = 10600
+// Minimum on-screen time so the intro animation reads — real readiness (all hero
+// frames + fonts loaded) is what actually drives dismissal now, not a timer.
+const MIN_DISPLAY_MS = 600
 // Hard ceiling: dismiss even if an asset silently stalls, so we never hang.
-const SAFETY_TIMEOUT_MS = 25000
+// Frames keep streaming in after this; the canvas falls back to the nearest
+// loaded frame, so an early dismiss degrades gracefully rather than breaking.
+const SAFETY_TIMEOUT_MS = 30000
 
 export function PageLoader() {
   const { allReady, progress } = useLoadingStatus()

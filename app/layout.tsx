@@ -40,6 +40,12 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${playfairDisplay.variable} ${manrope.variable}`} suppressHydrationWarning>
+      <head>
+        {/* Warm the connection to the Cloudinary CDN so the mobile hero frames
+            start downloading with no TLS/DNS handshake delay. */}
+        <link rel="preconnect" href="https://res.cloudinary.com" crossOrigin="" />
+        <link rel="dns-prefetch" href="https://res.cloudinary.com" />
+      </head>
       <body className="bg-brand-bg text-brand-text font-body antialiased">
         <Providers>
           {children}

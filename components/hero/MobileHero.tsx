@@ -4,22 +4,27 @@ import { useEffect, useRef, useCallback, useState } from 'react'
 import Link from 'next/link'
 import SplitText from '@/components/ui/SplitText'
 import { useLoadingReporter } from '@/components/loader/LoadingProvider'
+import { HERO_CLIPS, HERO_TOTAL_FRAMES } from '@/lib/heroFrames'
 
-const VIDEOS = [
-  '/videos/hero-video.mp4',
-  '/videos/burger-video.mp4',
-  '/videos/wings-video.mp4',
-  '/videos/fries-video.mp4',
-]
+// Autoplay clip that plays first (clip 0). The three scroll-scrubbed clips
+// (burger → wings → fries) are pre-rendered image frames served from Cloudinary.
+const AUTOPLAY_SRC = '/videos/hero-video.mp4'
 
-const DWELL_VH  = 50
-const FADE      = 0.4
-const FRAME_FPS = 15
+const DWELL_VH = 50
+const FADE     = 0.4
 
+// Scroll smoothing — velocity-aware lerp keeps fast flicks responsive while
+// slow drags stay glass-smooth.
 const LERP_BASE  = 0.08
 const LERP_SCALE = 0.18
 const LERP_CAP   = 0.72
-const SEEK_THR   = 1 / 30
+
+// Concurrent image downloads per clip. HTTP/2 multiplexes, but a small pool
+// keeps memory/CPU gentle on low-end phones and preserves burger-first order.
+const POOL_SIZE = 8
+// Cap canvas backing-store density: frames are 720px wide, so rendering past
+// ~2× DPR just burns fill-rate/GPU memory for no visible gain.
+const DPR_CAP = 2
 
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
   { pre: 'Stacked &', accent: 'Bold'  },
@@ -30,6 +35,9 @@ const CLIP_TEXTS: { pre: string; accent: string }[] = [
 const CLIP_TEXT_POSITIONS = ['bottom-28 left-5', 'bottom-28 left-5', 'bottom-28 left-5']
 const CLIP_TEXT_ALIGNS    = ['left', 'left', 'left'] as const
 
+const CLIP_COUNT = HERO_CLIPS.length          // 3 scroll clips
+const count      = CLIP_COUNT + 1             // + autoplay layer
+
 function clamp01(n: number) { return n < 0 ? 0 : n > 1 ? 1 : n }
 
 function smoothstep(n: number) {
@@ -37,25 +45,18 @@ function smoothstep(n: number) {
   return t * t * (3 - 2 * t)
 }
 
-function drawCover(ctx: CanvasRenderingContext2D, img: ImageBitmap, cw: number, ch: number) {
-  const scale = Math.max(cw / img.width, ch / img.height)
-  const w = img.width  * scale
-  const h = img.height * scale
+function drawCover(ctx: CanvasRenderingContext2D, img: HTMLImageElement, cw: number, ch: number) {
+  const iw = img.naturalWidth, ih = img.naturalHeight
+  if (!iw || !ih) return
+  const scale = Math.max(cw / iw, ch / ih)
+  const w = iw * scale
+  const h = ih * scale
   ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h)
-}
-
-/** Resolve when the video has its first frame ready to render. */
-function waitForFirstFrame(vid: HTMLVideoElement): Promise<void> {
-  return new Promise<void>((res, rej) => {
-    if (vid.readyState >= 2) { res(); return }
-    vid.addEventListener('loadeddata', () => res(), { once: true })
-    vid.addEventListener('error',      () => rej(),  { once: true })
-  })
 }
 
 export function MobileHero() {
   const sectionRef      = useRef<HTMLElement>(null)
-  const videoRefs       = useRef<(HTMLVideoElement | null)[]>([])
+  const videoRef        = useRef<HTMLVideoElement | null>(null)
   const layerRefs       = useRef<(HTMLDivElement | null)[]>([])
   const canvasRefs      = useRef<(HTMLCanvasElement | null)[]>([])
   const textOverlayRefs = useRef<(HTMLDivElement | null)[]>([])
@@ -63,14 +64,13 @@ export function MobileHero() {
   const scrollHintRef   = useRef<HTMLDivElement>(null)
   const rafRef          = useRef<number>(0)
 
-  const framesRef      = useRef<(ImageBitmap[] | null)[]>([null, null, null])
-  const lastFrameIdx   = useRef([-1, -1, -1])
-  // Set as soon as duration is known — keeps the t→frame mapping stable
-  // while extraction is still in progress (prevents index jumps).
-  const frameTotalsRef = useRef([0, 0, 0])
-
-  const extractAbortCtrlRef   = useRef<AbortController | null>(null)
-  const extractionStartedRef  = useRef(false)
+  // Per-clip image elements + load flags. Images hold compressed bytes (cheap);
+  // the browser decodes on draw and LRU-evicts — ideal for sequential scrubbing,
+  // so we never pin hundreds of decoded frames in memory.
+  const imagesRef    = useRef<(HTMLImageElement | null)[][]>(HERO_CLIPS.map(c => c.frames.map(() => null)))
+  const loadedRef    = useRef<boolean[][]>(HERO_CLIPS.map(c => c.frames.map(() => false)))
+  const lastFrameIdx = useRef<number[]>(HERO_CLIPS.map(() => -1))
+  const frameTotals  = useRef<number[]>(HERO_CLIPS.map(c => c.frames.length))
 
   const sectionTopRef = useRef(0)
   const denomRef      = useRef(1)
@@ -85,170 +85,105 @@ export function MobileHero() {
   const [textTriggered, setTextTriggered] = useState([false, false, false])
   const [textKeys,      setTextKeys]      = useState([0, 0, 0])
 
-  const count = VIDEOS.length
-
   const { reportReady, setProgress: reportProgress } = useLoadingReporter()
-  const heroReadyRef = useRef(false)
+  const videoReadyRef  = useRef(false)
+  const framesDoneRef  = useRef(false)
+  const heroReadyRef   = useRef(false)
 
-  // ── Extraction ────────────────────────────────────────────────────────────────
+  // ── Frame preloading (burger → wings → fries, with progress) ───────────────────
+  useEffect(() => {
+    let alive = true
+    let loaded = 0
 
-  /**
-   * Phase 1 — capture ONLY frame 0.
-   * At `loadeddata` the current frame (t=0) is already decoded, so this is just
-   * a GPU copy with no seeking. 3 calls in parallel ≈ 300 ms total.
-   */
-  const captureFirstFrame = useCallback(async (
-    src: string, fi: number, signal: AbortSignal,
-  ) => {
-    const vid = document.createElement('video')
-    vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
-    vid.load()
-
-    await waitForFirstFrame(vid)
-    if (signal.aborted) { vid.src = ''; return }
-
-    const duration = vid.duration
-    if (!isFinite(duration) || duration <= 0) { vid.src = ''; return }
-
-    try {
-      const bmp = await createImageBitmap(vid)
-      frameTotalsRef.current[fi] = Math.ceil(duration * FRAME_FPS)
-      framesRef.current[fi] = [bmp]
-    } catch {}
-
-    // Release the video element so the browser can free the download buffer
-    vid.src = ''; vid.load()
-  }, [])
-
-  /**
-   * Phase 2 — extract the remaining frames (1 … total-1) for one clip.
-   * Called SEQUENTIALLY across clips so only one video decoder runs at a time.
-   * A `setTimeout(0)` yield after every frame lets rAF callbacks (and scroll
-   * events) run between extractions — no main-thread starvation.
-   */
-  const extractRemainingFrames = useCallback(async (
-    src: string, fi: number, signal: AbortSignal,
-  ) => {
-    const vid = document.createElement('video')
-    vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
-    vid.load()
-
-    await waitForFirstFrame(vid)
-    if (signal.aborted) { vid.src = ''; return }
-
-    const duration = vid.duration
-    if (!isFinite(duration) || duration <= 0) { vid.src = ''; return }
-
-    const total = Math.ceil(duration * FRAME_FPS)
-    frameTotalsRef.current[fi] = total
-
-    // Start from phase-1 data (frame 0 already there); share the same array so
-    // updates are immediately visible to the rAF loop.
-    const frames: ImageBitmap[] = [...(framesRef.current[fi] ?? [])]
-
-    for (let f = frames.length; f < total; f++) {
-      if (signal.aborted) break
-
-      vid.currentTime = f / FRAME_FPS
-      // `seeked` is a DOM event (macrotask) — main thread is free while we wait
-      await new Promise<void>(r => vid.addEventListener('seeked', () => r(), { once: true }))
-      if (signal.aborted) break
-
-      try {
-        frames.push(await createImageBitmap(vid))
-        framesRef.current[fi] = frames
-      } catch {}
-
-      // Explicit macrotask yield so rAF isn't skipped between heavy seeks
-      await new Promise<void>(r => setTimeout(r, 0))
-    }
-
-    if (signal.aborted) {
-      // Only close frames added in this phase; phase-1 frame is handled by cleanup
-      const phase1Len = 1
-      frames.slice(phase1Len).forEach(b => b.close())
-      if (framesRef.current[fi] && framesRef.current[fi]!.length > phase1Len) {
-        framesRef.current[fi] = frames.slice(0, phase1Len)
+    const maybeReady = () => {
+      if (heroReadyRef.current) return
+      if (framesDoneRef.current && videoReadyRef.current) {
+        heroReadyRef.current = true
+        reportReady('hero')
       }
     }
 
-    vid.src = ''; vid.load()
-  }, [])
-
-  const startFrameExtraction = useCallback(async () => {
-    if (extractionStartedRef.current) return
-    extractionStartedRef.current = true
-    const ac = new AbortController()
-    extractAbortCtrlRef.current = ac
-
-    // ── Phase 1: all 3 first frames in PARALLEL ───────────────────────────────
-    // Scroll videos already have preload="auto" so data is in cache — fast.
-    await Promise.all(
-      VIDEOS.slice(1).map((src, fi) =>
-        captureFirstFrame(src, fi, ac.signal).catch(() => {}),
-      ),
-    )
-
-    // ── Phase 2: all 3 clips in PARALLEL with per-frame yield ────────────────
-    // Parallel extraction cuts total extraction time by ~3× vs sequential.
-    await Promise.all(
-      VIDEOS.slice(1).map((src, fi) =>
-        extractRemainingFrames(src, fi, ac.signal).catch(() => {}),
-      ),
-    )
-  }, [captureFirstFrame, extractRemainingFrames])
-
-  // Close all bitmaps when the component unmounts
-  useEffect(() => {
-    return () => {
-      extractAbortCtrlRef.current?.abort()
-      framesRef.current.forEach(frames => frames?.forEach(b => b.close()))
+    const onOne = () => {
+      loaded++
+      // Reserve a sliver of the bar for the autoplay video so the bar only
+      // hits 100% once everything (frames + video) is truly ready.
+      reportProgress('hero', (loaded / HERO_TOTAL_FRAMES) * 0.97 + (videoReadyRef.current ? 0.03 : 0))
+      if (loaded >= HERO_TOTAL_FRAMES) { framesDoneRef.current = true; maybeReady() }
     }
-  }, [])
 
-  // ── Hero ready ────────────────────────────────────────────────────────────────
+    const loadFrame = (ci: number, fi: number) => new Promise<void>(resolve => {
+      const img = new Image()
+      img.decoding = 'async'
+      imagesRef.current[ci][fi] = img
+      const done = () => {
+        if (!alive) return resolve()
+        loadedRef.current[ci][fi] = true
+        onOne()
+        resolve()
+      }
+      img.onload  = done
+      img.onerror = done // count errors too, so the loader can never hang
+      img.src = HERO_CLIPS[ci].frames[fi]
+    })
 
-  const markHeroReady = useCallback(() => {
+    // Pooled, in-order load of a single clip's frames.
+    const loadClip = async (ci: number) => {
+      const n = HERO_CLIPS[ci].frames.length
+      let next = 0
+      const worker = async () => {
+        while (alive && next < n) {
+          const fi = next++
+          await loadFrame(ci, fi)
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(POOL_SIZE, n) }, worker))
+    }
+
+    // Clips load sequentially so burger is fully ready before wings, etc.
+    ;(async () => {
+      for (let ci = 0; ci < CLIP_COUNT; ci++) {
+        if (!alive) break
+        await loadClip(ci)
+      }
+    })()
+
+    return () => { alive = false }
+  }, [reportProgress, reportReady])
+
+  // Expose a stable callback for the autoplay video's ready/error events.
+  const markVideoReady = useCallback(() => {
+    if (videoReadyRef.current) return
+    videoReadyRef.current = true
     if (heroReadyRef.current) return
-    heroReadyRef.current = true
-    reportReady('hero')
-    startFrameExtraction()
-  }, [reportReady, startFrameExtraction])
+    if (framesDoneRef.current) {
+      heroReadyRef.current = true
+      reportReady('hero')
+    }
+  }, [reportReady])
 
   const onHeroProgress = useCallback(() => {
-    const v = videoRefs.current[0]
+    const v = videoRef.current
     if (!v || !isFinite(v.duration) || v.duration <= 0) return
     try {
       const end = v.buffered.length ? v.buffered.end(v.buffered.length - 1) : 0
-      reportProgress('hero', end / v.duration)
+      if (end / v.duration >= 0.25) markVideoReady() // enough buffered to loop cleanly
     } catch {}
-  }, [reportProgress])
+  }, [markVideoReady])
 
   useEffect(() => {
-    const v = videoRefs.current[0]
-    if (v && v.readyState >= 2) markHeroReady()
-  }, [markHeroReady])
-
-  useEffect(() => {
-    videoRefs.current.slice(1).forEach(v => { if (v) v.pause() })
-  }, [])
-
-  // Fallback: if hero isn't ready within 1.2 s, start extraction anyway.
-  // Scroll videos are already buffering (preload="auto"), so this is fast.
-  useEffect(() => {
-    const t = setTimeout(() => startFrameExtraction(), 1200)
-    return () => clearTimeout(t)
-  }, [startFrameExtraction])
+    const v = videoRef.current
+    if (v && v.readyState >= 2) markVideoReady()
+  }, [markVideoReady])
 
   // ── Canvas sizing ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const resize = () => {
-      const dpr = window.devicePixelRatio || 1
+      const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP)
       canvasRefs.current.forEach((canvas, fi) => {
         if (!canvas) return
         canvas.width  = Math.round(window.innerWidth  * dpr)
         canvas.height = Math.round(window.innerHeight * dpr)
-        lastFrameIdx.current[fi] = -1
+        lastFrameIdx.current[fi] = -1 // force redraw at new size
       })
     }
     resize()
@@ -294,7 +229,20 @@ export function MobileHero() {
     const boundary = i * seg
     const halfFade = (seg * FADE) / 2
     return smoothstep((p - (boundary - halfFade)) / (halfFade * 2))
-  }, [count])
+  }, [])
+
+  // Nearest already-loaded frame to `idx` (used only if rendering ever races the
+  // download; after the loader lifts, every frame is present and idx is exact).
+  const pickFrame = useCallback((ci: number, idx: number): HTMLImageElement | null => {
+    const imgs = imagesRef.current[ci]
+    const ld   = loadedRef.current[ci]
+    if (ld[idx]) return imgs[idx]
+    for (let d = 1; d < imgs.length; d++) {
+      if (idx - d >= 0 && ld[idx - d]) return imgs[idx - d]
+      if (idx + d < imgs.length && ld[idx + d]) return imgs[idx + d]
+    }
+    return null
+  }, [])
 
   // ── rAF loop ──────────────────────────────────────────────────────────────────
   const update = useCallback(() => {
@@ -313,30 +261,18 @@ export function MobileHero() {
       const t  = clamp01((p - i * seg) / seg)
       const fi = i - 1
 
-      const frames = framesRef.current[fi]
       const canvas = canvasRefs.current[fi]
-      const total  = frameTotalsRef.current[fi]
-      const frameIdx = total > 0 ? Math.floor(t * total) : -1
+      const total  = frameTotals.current[fi]
+      if (!canvas || total <= 0) continue
 
-      if (frames && canvas && frameIdx >= 0 && frameIdx < frames.length) {
-        // Exact extracted frame is available — draw it to canvas (covers video)
-        if (frameIdx !== lastFrameIdx.current[fi]) {
-          lastFrameIdx.current[fi] = frameIdx
-          const ctx = canvas.getContext('2d')
-          if (ctx) drawCover(ctx, frames[frameIdx], canvas.width, canvas.height)
-        }
-      } else {
-        // Frame not yet extracted — clear canvas so video shows through, then seek it
-        if (canvas && lastFrameIdx.current[fi] !== -2) {
-          lastFrameIdx.current[fi] = -2
-          const ctx = canvas.getContext('2d')
-          if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height)
-        }
-        const v = videoRefs.current[i]
-        if (v && isFinite(v.duration) && v.duration > 0) {
-          const target = t * v.duration
-          if (Math.abs(v.currentTime - target) > SEEK_THR) v.currentTime = target
-        }
+      const frameIdx = Math.min(total - 1, Math.floor(t * total))
+      if (frameIdx === lastFrameIdx.current[fi]) continue
+
+      const img = pickFrame(fi, frameIdx)
+      if (img) {
+        lastFrameIdx.current[fi] = frameIdx
+        const ctx = canvas.getContext('2d')
+        if (ctx) drawCover(ctx, img, canvas.width, canvas.height)
       }
     }
 
@@ -345,9 +281,8 @@ export function MobileHero() {
       if (layer) layer.style.opacity = String(layerOpacity(i, p))
     }
 
-    // Text: trigger when layer is fully visible (≥95%) for maximum animation
-    // window before the next layer's crossfade fades the overlay out.
-    for (let i = 0; i < 3; i++) {
+    // Text: trigger when a layer is ~fully visible, fade out as the next arrives.
+    for (let i = 0; i < CLIP_COUNT; i++) {
       const overlay  = textOverlayRefs.current[i]
       const layerVis = layerOpacity(i + 1, p)
 
@@ -369,16 +304,16 @@ export function MobileHero() {
     }
 
     if (textRef.current) {
-      const t = 1 - layerOpacity(1, p)
-      textRef.current.style.opacity   = String(t)
-      textRef.current.style.transform = `translateY(${(1 - t) * -24}px)`
+      const tt = 1 - layerOpacity(1, p)
+      textRef.current.style.opacity   = String(tt)
+      textRef.current.style.transform = `translateY(${(1 - tt) * -24}px)`
     }
     if (scrollHintRef.current) {
       scrollHintRef.current.style.opacity = p < 0.04 ? '0.6' : '0'
     }
 
     rafRef.current = requestAnimationFrame(update)
-  }, [count, layerOpacity])
+  }, [layerOpacity, pickFrame])
 
   useEffect(() => {
     rafRef.current = requestAnimationFrame(update)
@@ -389,7 +324,7 @@ export function MobileHero() {
     <section
       ref={sectionRef}
       aria-label="Hero"
-      style={{ height: `calc(100svh + ${count * DWELL_VH}svh)` }}
+      style={{ height: `calc(100svh + ${CLIP_COUNT * DWELL_VH}svh)` }}
     >
       <div className="sticky top-0 h-[100svh] overflow-hidden">
 
@@ -401,39 +336,29 @@ export function MobileHero() {
           aria-hidden="true"
         >
           <video
-            ref={el => { videoRefs.current[0] = el }}
-            src={VIDEOS[0]}
+            ref={el => { videoRef.current = el }}
+            src={AUTOPLAY_SRC}
             muted autoPlay loop playsInline preload="auto"
-            onLoadedData={markHeroReady}
-            onCanPlayThrough={markHeroReady}
-            onError={markHeroReady}
+            onLoadedData={markVideoReady}
+            onCanPlayThrough={markVideoReady}
+            onError={markVideoReady}
             onProgress={onHeroProgress}
             className="absolute inset-0 w-full h-full object-cover"
             style={{ transform: 'translateZ(0)' }}
           />
         </div>
 
-        {/* ── Clips 1–3: canvas (frames) + video fallback ───────────────────────── */}
-        {VIDEOS.slice(1).map((src, fi) => {
+        {/* ── Clips 1–3: Cloudinary frame canvases ─────────────────────────────── */}
+        {HERO_CLIPS.map((clip, fi) => {
           const i = fi + 1
           return (
             <div
-              key={src}
+              key={clip.name}
               ref={el => { layerRefs.current[i] = el }}
               className="absolute inset-0"
               style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
               aria-hidden="true"
             >
-              {/* Fallback video — preload="auto" buffers data so seeking works immediately */}
-              <video
-                ref={el => { videoRefs.current[i] = el }}
-                src={src}
-                muted playsInline preload="auto"
-                className="absolute inset-0 w-full h-full object-cover"
-                style={{ transform: 'translateZ(0)' }}
-              />
-              {/* Canvas on top — shows frame 0 within ~300 ms of hero ready,
-                  then progressively sharper scrubbing as more frames arrive */}
               <canvas
                 ref={el => { canvasRefs.current[fi] = el }}
                 className="absolute inset-0 w-full h-full"
