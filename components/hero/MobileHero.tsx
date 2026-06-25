@@ -14,7 +14,7 @@ const VIDEOS = [
 
 const DWELL_VH  = 50
 const FADE      = 0.4
-const FRAME_FPS = 10
+const FRAME_FPS = 24
 
 const LERP_BASE  = 0.055
 const LERP_SCALE = 0.12
@@ -92,42 +92,18 @@ export function MobileHero() {
   // ── Extraction ────────────────────────────────────────────────────────────────
 
   /**
-   * Phase 1 — capture ONLY frame 0.
-   * At `loadeddata` the current frame (t=0) is already decoded, so this is just
-   * a GPU copy with no seeking. 3 calls in parallel ≈ 300 ms total.
+   * Extracts all frames for one clip at CSS-pixel resolution (not native video
+   * resolution). Storing at CSS-pixel size gives 4-9× memory savings on high-DPR
+   * devices, which is what makes 24 fps sustainable. The `frames` array is exposed
+   * to the rAF loop immediately so partial results are used progressively — the
+   * video-seek fallback handles any positions not yet extracted.
    */
-  const captureFirstFrame = useCallback(async (
+  const extractAllFrames = useCallback(async (
     src: string, fi: number, signal: AbortSignal,
   ) => {
-    const vid = document.createElement('video')
-    vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
-    vid.load()
+    const capW = Math.ceil(window.innerWidth)
+    const capH = Math.ceil(window.innerHeight)
 
-    await waitForFirstFrame(vid)
-    if (signal.aborted) { vid.src = ''; return }
-
-    const duration = vid.duration
-    if (!isFinite(duration) || duration <= 0) { vid.src = ''; return }
-
-    try {
-      const bmp = await createImageBitmap(vid)
-      frameTotalsRef.current[fi] = Math.ceil(duration * FRAME_FPS)
-      framesRef.current[fi] = [bmp]
-    } catch {}
-
-    // Release the video element so the browser can free the download buffer
-    vid.src = ''; vid.load()
-  }, [])
-
-  /**
-   * Phase 2 — extract the remaining frames (1 … total-1) for one clip.
-   * Called SEQUENTIALLY across clips so only one video decoder runs at a time.
-   * A `setTimeout(0)` yield after every frame lets rAF callbacks (and scroll
-   * events) run between extractions — no main-thread starvation.
-   */
-  const extractRemainingFrames = useCallback(async (
-    src: string, fi: number, signal: AbortSignal,
-  ) => {
     const vid = document.createElement('video')
     vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
     vid.load()
@@ -141,34 +117,37 @@ export function MobileHero() {
     const total = Math.ceil(duration * FRAME_FPS)
     frameTotalsRef.current[fi] = total
 
-    // Start from phase-1 data (frame 0 already there); share the same array so
-    // updates are immediately visible to the rAF loop.
-    const frames: ImageBitmap[] = [...(framesRef.current[fi] ?? [])]
+    // One off-screen canvas per clip, reused for all frames to avoid GC churn
+    const oc = document.createElement('canvas')
+    oc.width = capW; oc.height = capH
+    const octx = oc.getContext('2d')
+    if (!octx) { vid.src = ''; return }
 
-    for (let f = frames.length; f < total; f++) {
+    const frames: ImageBitmap[] = []
+    framesRef.current[fi] = frames   // rAF picks up frames as they arrive
+
+    for (let f = 0; f < total; f++) {
       if (signal.aborted) break
 
-      vid.currentTime = f / FRAME_FPS
-      // `seeked` is a DOM event (macrotask) — main thread is free while we wait
-      await new Promise<void>(r => vid.addEventListener('seeked', () => r(), { once: true }))
-      if (signal.aborted) break
+      if (f > 0) {
+        vid.currentTime = f / FRAME_FPS
+        await new Promise<void>(r => vid.addEventListener('seeked', () => r(), { once: true }))
+        if (signal.aborted) break
+      }
 
       try {
-        frames.push(await createImageBitmap(vid))
-        framesRef.current[fi] = frames
-      } catch {}
-
-      // Explicit macrotask yield so rAF isn't skipped between heavy seeks
-      await new Promise<void>(r => setTimeout(r, 0))
-    }
-
-    if (signal.aborted) {
-      // Only close frames added in this phase; phase-1 frame is handled by cleanup
-      const phase1Len = 1
-      frames.slice(phase1Len).forEach(b => b.close())
-      if (framesRef.current[fi] && framesRef.current[fi]!.length > phase1Len) {
-        framesRef.current[fi] = frames.slice(0, phase1Len)
+        const vw = vid.videoWidth  > 0 ? vid.videoWidth  : capW
+        const vh = vid.videoHeight > 0 ? vid.videoHeight : capH
+        const sc = Math.max(capW / vw, capH / vh)
+        octx.clearRect(0, 0, capW, capH)
+        octx.drawImage(vid, (capW - vw * sc) / 2, (capH - vh * sc) / 2, vw * sc, vh * sc)
+        frames.push(await createImageBitmap(oc))
+      } catch {
+        break   // createImageBitmap unsupported — video-seek fallback stays active
       }
+
+      // Yield one macrotask so rAF and scroll events aren't starved between seeks
+      await new Promise<void>(r => setTimeout(r, 0))
     }
 
     vid.src = ''; vid.load()
@@ -178,27 +157,18 @@ export function MobileHero() {
     const ac = new AbortController()
     extractAbortCtrlRef.current = ac
 
-    // Load all three fallback video elements immediately so the rAF video-seek
-    // fallback works right away while frames are being extracted.
+    // Preload in-DOM fallback videos so video-seeking is ready immediately
     videoRefs.current.slice(1).forEach(v => {
       if (v) { v.preload = 'auto'; v.load() }
     })
 
-    // ── Phase 1: all 3 first frames in PARALLEL (~300 ms) ────────────────────
-    // Each call only needs loadeddata + one GPU copy — no seek, minimal CPU.
+    // All 3 clips extract IN PARALLEL — 3× faster than the old sequential approach
     await Promise.all(
       VIDEOS.slice(1).map((src, fi) =>
-        captureFirstFrame(src, fi, ac.signal).catch(() => {}),
+        extractAllFrames(src, fi, ac.signal).catch(() => {}),
       ),
     )
-
-    // ── Phase 2: remaining frames SEQUENTIALLY + per-frame yield ─────────────
-    // One video decoder at a time → no CPU overload, rAF stays smooth.
-    for (let fi = 0; fi < 3; fi++) {
-      if (ac.signal.aborted) break
-      await extractRemainingFrames(VIDEOS[fi + 1], fi, ac.signal).catch(() => {})
-    }
-  }, [captureFirstFrame, extractRemainingFrames])
+  }, [extractAllFrames])
 
   // Close all bitmaps when the component unmounts
   useEffect(() => {
