@@ -28,9 +28,12 @@ const LERP_CAP   = 0.9
  *   pool      = parallel downloads (higher = faster load, but more CPU)
  */
 type Tier = { target: number; transform: string; dpr: number; pool: number }
-const TIER_HIGH: Tier = { target: 64, transform: 'f_auto,q_auto:eco',       dpr: 2,    pool: 8 }
-const TIER_MID:  Tier = { target: 44, transform: 'f_auto,q_auto:eco,w_560', dpr: 1.5,  pool: 6 }
-const TIER_LOW:  Tier = { target: 30, transform: 'f_auto,q_auto:low,w_420', dpr: 1.25, pool: 4 }
+// High-end: AVIF (f_auto) is the smallest download and these phones decode it
+// easily. Mid/low: FORCE WebP — it's both smaller here *and* far cheaper to
+// decode than AVIF, which is what makes weak phones render fast.
+const TIER_HIGH: Tier = { target: 64, transform: 'f_auto,q_auto:eco',        dpr: 2,    pool: 12 }
+const TIER_MID:  Tier = { target: 44, transform: 'f_webp,q_auto:low,w_560',  dpr: 1.5,  pool: 8  }
+const TIER_LOW:  Tier = { target: 30, transform: 'f_webp,q_auto:low,w_420',  dpr: 1.25, pool: 6  }
 
 function detectTier(): Tier {
   if (typeof navigator === 'undefined') return TIER_HIGH
@@ -177,14 +180,31 @@ export function MobileHero() {
         loadedRef.current[ci][fi] = true
         loaded++
         reportFrames()
-        if (loaded >= totalFrames) { framesDoneRef.current = true; maybeReady() }
-        img.decode?.().catch(() => {}) // warm the decode cache (browser-managed)
+        if (loaded >= totalFrames) { framesDoneRef.current = true; maybeReady(); warmDecodeCache() }
         resolve()
       }
       img.onload  = done
       img.onerror = done // count errors too, so the gate can never hang
       img.src = clipFrames[ci][fi]
     })
+
+    // After the gate is satisfied, decode every frame once — sequentially and
+    // gently, in the idle time while the user reads the hero copy — so the first
+    // scrub of each frame is jank-free. This is kept OUT of the load phase so the
+    // loader stays purely download-bound (fastest possible reveal).
+    let warmed = false
+    const warmDecodeCache = () => {
+      if (warmed) return
+      warmed = true
+      setTimeout(async () => {
+        for (const arr of imagesRef.current) {
+          for (const im of arr) {
+            if (!alive) return
+            try { await im?.decode?.() } catch {}
+          }
+        }
+      }, 300)
+    }
 
     // One ordered queue across all clips (burger frames first → wings → fries),
     // drained by `pool` parallel workers for maximum throughput.
