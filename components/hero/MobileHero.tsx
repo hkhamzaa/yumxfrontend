@@ -14,14 +14,11 @@ const VIDEOS = [
 
 const DWELL_VH  = 50
 const FADE      = 0.4
-// 30 fps target — more than enough for butter-smooth canvas scrubbing.
-// Playback-based extraction makes this essentially free vs the old seek loop.
-const FRAME_FPS = 30
+const FRAME_FPS = 10
 
-// Slightly more responsive lerp so scrubbing feels immediate
-const LERP_BASE  = 0.08
-const LERP_SCALE = 0.10
-const LERP_CAP   = 0.55
+const LERP_BASE  = 0.055
+const LERP_SCALE = 0.12
+const LERP_CAP   = 0.65
 const SEEK_THR   = 1 / 30
 
 const CLIP_TEXTS: { pre: string; accent: string }[] = [
@@ -47,6 +44,7 @@ function drawCover(ctx: CanvasRenderingContext2D, img: ImageBitmap, cw: number, 
   ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h)
 }
 
+/** Resolve when the video has its first frame ready to render. */
 function waitForFirstFrame(vid: HTMLVideoElement): Promise<void> {
   return new Promise<void>((res, rej) => {
     if (vid.readyState >= 2) { res(); return }
@@ -65,9 +63,10 @@ export function MobileHero() {
   const scrollHintRef   = useRef<HTMLDivElement>(null)
   const rafRef          = useRef<number>(0)
 
-  // Sparse array: null = not yet captured, ImageBitmap = ready to draw
-  const framesRef      = useRef<((ImageBitmap | null)[] | null)[]>([null, null, null])
+  const framesRef      = useRef<(ImageBitmap[] | null)[]>([null, null, null])
   const lastFrameIdx   = useRef([-1, -1, -1])
+  // Set as soon as duration is known — keeps the t→frame mapping stable
+  // while extraction is still in progress (prevents index jumps).
   const frameTotalsRef = useRef([0, 0, 0])
 
   const extractAbortCtrlRef = useRef<AbortController | null>(null)
@@ -91,28 +90,46 @@ export function MobileHero() {
   const heroReadyRef = useRef(false)
 
   // ── Extraction ────────────────────────────────────────────────────────────────
-  //
-  // Instead of seeking frame-by-frame (200–500 ms per seek on mobile = 20+ s total),
-  // we PLAY each video at 2× speed and capture frames as they decode.
-  // A 3-second clip finishes in ~1.5 real seconds. Three clips run in parallel,
-  // so all frames are ready in ~1.5 s total — regardless of how many fps we target.
-  //
-  // Storage: pre-allocated null array. The rAF reads frames[frameIdx]; if null it
-  // falls back to in-DOM video seeking (smooth from the first scroll) and fills in
-  // canvas frames as they arrive progressively.
-  //
-  // CSS-pixel capture (not native video res) gives 4–9× memory savings on high-DPR
-  // screens, which is what makes 30 fps sustainable without OOM crashes.
 
-  const extractAllFrames = useCallback(async (
+  /**
+   * Phase 1 — capture ONLY frame 0.
+   * At `loadeddata` the current frame (t=0) is already decoded, so this is just
+   * a GPU copy with no seeking. 3 calls in parallel ≈ 300 ms total.
+   */
+  const captureFirstFrame = useCallback(async (
     src: string, fi: number, signal: AbortSignal,
   ) => {
-    const capW = Math.ceil(window.innerWidth)
-    const capH = Math.ceil(window.innerHeight)
-
     const vid = document.createElement('video')
     vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
-    vid.playbackRate = 2   // extract at 2× real-time speed
+    vid.load()
+
+    await waitForFirstFrame(vid)
+    if (signal.aborted) { vid.src = ''; return }
+
+    const duration = vid.duration
+    if (!isFinite(duration) || duration <= 0) { vid.src = ''; return }
+
+    try {
+      const bmp = await createImageBitmap(vid)
+      frameTotalsRef.current[fi] = Math.ceil(duration * FRAME_FPS)
+      framesRef.current[fi] = [bmp]
+    } catch {}
+
+    // Release the video element so the browser can free the download buffer
+    vid.src = ''; vid.load()
+  }, [])
+
+  /**
+   * Phase 2 — extract the remaining frames (1 … total-1) for one clip.
+   * Called SEQUENTIALLY across clips so only one video decoder runs at a time.
+   * A `setTimeout(0)` yield after every frame lets rAF callbacks (and scroll
+   * events) run between extractions — no main-thread starvation.
+   */
+  const extractRemainingFrames = useCallback(async (
+    src: string, fi: number, signal: AbortSignal,
+  ) => {
+    const vid = document.createElement('video')
+    vid.src = src; vid.muted = true; vid.playsInline = true; vid.preload = 'auto'
     vid.load()
 
     await waitForFirstFrame(vid)
@@ -124,99 +141,70 @@ export function MobileHero() {
     const total = Math.ceil(duration * FRAME_FPS)
     frameTotalsRef.current[fi] = total
 
-    // One shared off-screen canvas per clip — reused every frame, no GC churn
-    const oc = document.createElement('canvas')
-    oc.width = capW; oc.height = capH
-    const octx = oc.getContext('2d')
-    if (!octx) { vid.src = ''; return }
+    // Start from phase-1 data (frame 0 already there); share the same array so
+    // updates are immediately visible to the rAF loop.
+    const frames: ImageBitmap[] = [...(framesRef.current[fi] ?? [])]
 
-    // Expose the array immediately so the rAF can start showing partial results
-    const frames: (ImageBitmap | null)[] = new Array(total).fill(null)
-    framesRef.current[fi] = frames
+    for (let f = frames.length; f < total; f++) {
+      if (signal.aborted) break
 
-    // Snapshot the current video frame into a bitmap stored at CSS-pixel resolution
-    const captureAt = (mediaTime: number) => {
-      const frameIdx = Math.min(total - 1, Math.floor(mediaTime * FRAME_FPS))
-      if (frames[frameIdx] !== null || signal.aborted) return
+      vid.currentTime = f / FRAME_FPS
+      // `seeked` is a DOM event (macrotask) — main thread is free while we wait
+      await new Promise<void>(r => vid.addEventListener('seeked', () => r(), { once: true }))
+      if (signal.aborted) break
 
-      const vw = vid.videoWidth  > 0 ? vid.videoWidth  : capW
-      const vh = vid.videoHeight > 0 ? vid.videoHeight : capH
-      const sc = Math.max(capW / vw, capH / vh)
-      octx.clearRect(0, 0, capW, capH)
-      octx.drawImage(vid, (capW - vw * sc) / 2, (capH - vh * sc) / 2, vw * sc, vh * sc)
+      try {
+        frames.push(await createImageBitmap(vid))
+        framesRef.current[fi] = frames
+      } catch {}
 
-      // createImageBitmap snapshots the canvas state at call time — the canvas can
-      // be reused for the next frame before this promise resolves
-      createImageBitmap(oc).then(bmp => {
-        if (!signal.aborted && frames[frameIdx] === null) {
-          frames[frameIdx] = bmp
-        } else {
-          bmp.close()   // aborted or duplicate — release GPU memory immediately
-        }
-      }).catch(() => {})
+      // Explicit macrotask yield so rAF isn't skipped between heavy seeks
+      await new Promise<void>(r => setTimeout(r, 0))
     }
 
-    const supportsRVFC = 'requestVideoFrameCallback' in vid
-
-    await new Promise<void>(resolve => {
-      const done = () => resolve()
-      vid.addEventListener('ended', done, { once: true })
-      vid.addEventListener('error', done, { once: true })
-
-      if (supportsRVFC) {
-        // requestVideoFrameCallback fires exactly when a decoded frame is ready —
-        // more accurate than rAF and no frame duplication
-        const onFrame = (_: number, meta: { mediaTime: number }) => {
-          if (signal.aborted) { done(); return }
-          captureAt(meta.mediaTime)
-          if (!signal.aborted && meta.mediaTime < duration - 0.5 / FRAME_FPS) {
-            ;(vid as any).requestVideoFrameCallback(onFrame)
-          } else {
-            done()
-          }
-        }
-        ;(vid as any).requestVideoFrameCallback(onFrame)
-      } else {
-        // rAF fallback: at 2× playback + 60 fps screen, video advances ~1 target
-        // frame per rAF tick, so we still capture every frame without seeking
-        const v = vid as HTMLVideoElement   // break TS narrowing from the `in` guard
-        let rafId = 0
-        const loop = () => {
-          if (signal.aborted || v.ended) { cancelAnimationFrame(rafId); done(); return }
-          captureAt(v.currentTime)
-          rafId = requestAnimationFrame(loop)
-        }
-        rafId = requestAnimationFrame(loop)
+    if (signal.aborted) {
+      // Only close frames added in this phase; phase-1 frame is handled by cleanup
+      const phase1Len = 1
+      frames.slice(phase1Len).forEach(b => b.close())
+      if (framesRef.current[fi] && framesRef.current[fi]!.length > phase1Len) {
+        framesRef.current[fi] = frames.slice(0, phase1Len)
       }
+    }
 
-      vid.play().catch(done)
-    })
-
-    vid.pause(); vid.src = ''; vid.load()
+    vid.src = ''; vid.load()
   }, [])
 
   const startFrameExtraction = useCallback(async () => {
     const ac = new AbortController()
     extractAbortCtrlRef.current = ac
 
-    // Preload in-DOM fallback videos so video-seeking works immediately
+    // Load all three fallback video elements immediately so the rAF video-seek
+    // fallback works right away while frames are being extracted.
     videoRefs.current.slice(1).forEach(v => {
       if (v) { v.preload = 'auto'; v.load() }
     })
 
-    // All 3 clips in PARALLEL — total extraction time ≈ length of longest clip / 2
+    // ── Phase 1: all 3 first frames in PARALLEL (~300 ms) ────────────────────
+    // Each call only needs loadeddata + one GPU copy — no seek, minimal CPU.
     await Promise.all(
       VIDEOS.slice(1).map((src, fi) =>
-        extractAllFrames(src, fi, ac.signal).catch(() => {}),
+        captureFirstFrame(src, fi, ac.signal).catch(() => {}),
       ),
     )
-  }, [extractAllFrames])
 
-  // Close all bitmaps on unmount
+    // ── Phase 2: remaining frames SEQUENTIALLY + per-frame yield ─────────────
+    // One video decoder at a time → no CPU overload, rAF stays smooth.
+    for (let fi = 0; fi < 3; fi++) {
+      if (ac.signal.aborted) break
+      await extractRemainingFrames(VIDEOS[fi + 1], fi, ac.signal).catch(() => {})
+    }
+  }, [captureFirstFrame, extractRemainingFrames])
+
+  // Close all bitmaps when the component unmounts
   useEffect(() => {
     return () => {
       extractAbortCtrlRef.current?.abort()
-      framesRef.current.forEach(frames => frames?.forEach(b => b?.close()))
+      framesRef.current.forEach(frames => frames?.forEach(b => b.close()))
     }
   }, [])
 
@@ -320,23 +308,20 @@ export function MobileHero() {
       const t  = clamp01((p - i * seg) / seg)
       const fi = i - 1
 
-      const frames   = framesRef.current[fi]
-      const canvas   = canvasRefs.current[fi]
-      const total    = frameTotalsRef.current[fi]
+      const frames = framesRef.current[fi]
+      const canvas = canvasRefs.current[fi]
+      const total  = frameTotalsRef.current[fi]
       const frameIdx = total > 0 ? Math.floor(t * total) : -1
 
-      // Exact extracted frame available → draw it to canvas (covers the video layer)
-      const bmp = (frames && frameIdx >= 0 && frameIdx < total) ? frames[frameIdx] : null
-
-      if (bmp != null) {
-        if (canvas && frameIdx !== lastFrameIdx.current[fi]) {
+      if (frames && canvas && frameIdx >= 0 && frameIdx < frames.length) {
+        // Exact extracted frame is available — draw it to canvas (covers video)
+        if (frameIdx !== lastFrameIdx.current[fi]) {
           lastFrameIdx.current[fi] = frameIdx
           const ctx = canvas.getContext('2d')
-          if (ctx) drawCover(ctx, bmp, canvas.width, canvas.height)
+          if (ctx) drawCover(ctx, frames[frameIdx], canvas.width, canvas.height)
         }
       } else {
-        // Frame not yet captured: clear canvas so the in-DOM video shows through,
-        // and seek that video to the correct time for immediate smooth scrubbing
+        // Frame not yet extracted — clear canvas so video shows through, then seek it
         if (canvas && lastFrameIdx.current[fi] !== -2) {
           lastFrameIdx.current[fi] = -2
           const ctx = canvas.getContext('2d')
@@ -355,6 +340,8 @@ export function MobileHero() {
       if (layer) layer.style.opacity = String(layerOpacity(i, p))
     }
 
+    // Text: trigger when layer is fully visible (≥95%) for maximum animation
+    // window before the next layer's crossfade fades the overlay out.
     for (let i = 0; i < 3; i++) {
       const overlay  = textOverlayRefs.current[i]
       const layerVis = layerOpacity(i + 1, p)
@@ -421,7 +408,7 @@ export function MobileHero() {
           />
         </div>
 
-        {/* ── Clips 1–3: canvas (extracted frames) + video fallback ─────────────── */}
+        {/* ── Clips 1–3: canvas (frames) + video fallback ───────────────────────── */}
         {VIDEOS.slice(1).map((src, fi) => {
           const i = fi + 1
           return (
@@ -432,8 +419,7 @@ export function MobileHero() {
               style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
               aria-hidden="true"
             >
-              {/* In-DOM video: preload="metadata" so duration is immediately available
-                  for the seeking fallback. Full data loads via startFrameExtraction. */}
+              {/* Fallback video — metadata preloads immediately so duration is ready for seeking */}
               <video
                 ref={el => { videoRefs.current[i] = el }}
                 src={src}
@@ -441,9 +427,8 @@ export function MobileHero() {
                 className="absolute inset-0 w-full h-full object-cover"
                 style={{ transform: 'translateZ(0)' }}
               />
-              {/* Canvas sits on top — transparent until a bitmap is drawn into it.
-                  The rAF clears it back to transparent when falling back to video seek,
-                  then draws extracted bitmaps as they arrive from extractAllFrames. */}
+              {/* Canvas on top — shows frame 0 within ~300 ms of hero ready,
+                  then progressively sharper scrubbing as more frames arrive */}
               <canvas
                 ref={el => { canvasRefs.current[fi] = el }}
                 className="absolute inset-0 w-full h-full"
