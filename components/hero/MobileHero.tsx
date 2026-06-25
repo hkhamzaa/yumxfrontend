@@ -13,27 +13,28 @@ const AUTOPLAY_SRC = '/videos/hero-video.mp4'
 const DWELL_VH = 50
 const FADE     = 0.4
 
-// Scroll smoothing — velocity-aware lerp keeps fast flicks responsive while
-// slow drags stay glass-smooth.
-const LERP_BASE  = 0.08
-const LERP_SCALE = 0.18
-const LERP_CAP   = 0.72
+// Scroll smoothing — snappy enough to track the finger (no lag) yet smoothed so
+// micro-jitter never shows. Velocity scaling near-direct-maps on fast flicks.
+const LERP_BASE  = 0.22
+const LERP_SCALE = 0.22
+const LERP_CAP   = 0.9
 
-// Concurrent image downloads. HTTP/2 multiplexes, but a small pool keeps
-// memory/CPU gentle on low-end phones and preserves burger-first ordering.
-const POOL_SIZE = 6
+// Download concurrency. Burger gates the reveal so it gets a fat pool; the
+// background clips stay gentle to keep CPU free for buttery scrubbing.
+const POOL_BURGER = 8
+const POOL_BG     = 4
 
 /**
- * Device tier — picks how many frames to load and how heavy each one is, so the
- * weakest phone on the slowest link still loads fast and scrubs smoothly:
- *   step      = frame subsample (higher = fewer frames = less data + less decode)
+ * Device tier — decides how many frames to load and how heavy each one is, so
+ * the weakest phone on the slowest link still loads fast and scrubs smoothly:
+ *   target    = frames per clip after subsampling (fewer = less data + decode)
  *   transform = Cloudinary delivery (smaller width = far cheaper to decode/draw)
- *   dpr       = canvas backing-store density cap (lower = less GPU fill = battery)
+ *   dpr       = canvas backing-store density cap (lower = less GPU fill)
  */
-type Tier = { step: number; transform: string; dpr: number }
-const TIER_HIGH: Tier = { step: 1, transform: 'f_auto,q_auto:eco',        dpr: 2    }
-const TIER_MID:  Tier = { step: 2, transform: 'f_auto,q_auto:eco,w_560',  dpr: 1.5  }
-const TIER_LOW:  Tier = { step: 3, transform: 'f_auto,q_auto:low,w_420',  dpr: 1.25 }
+type Tier = { target: number; transform: string; dpr: number }
+const TIER_HIGH: Tier = { target: 64, transform: 'f_auto,q_auto:eco',       dpr: 2    }
+const TIER_MID:  Tier = { target: 44, transform: 'f_auto,q_auto:eco,w_560', dpr: 1.5  }
+const TIER_LOW:  Tier = { target: 30, transform: 'f_auto,q_auto:low,w_420', dpr: 1.25 }
 
 function detectTier(): Tier {
   if (typeof navigator === 'undefined') return TIER_HIGH
@@ -51,13 +52,15 @@ function detectTier(): Tier {
   return TIER_HIGH
 }
 
-/** Pick every `step`-th item, always keeping the first and last frame. */
-function subsample<T>(arr: T[], step: number): T[] {
+/** Pick ~`target` evenly-spaced frames, always keeping the first and last. */
+function subsampleToTarget<T>(arr: T[], target: number): T[] {
+  const n = arr.length
+  if (target <= 0 || target >= n) return arr
+  const step = Math.max(1, Math.round(n / target))
   if (step <= 1) return arr
   const out: T[] = []
-  for (let i = 0; i < arr.length; i += step) out.push(arr[i])
-  const last = arr[arr.length - 1]
-  if (out[out.length - 1] !== last) out.push(last)
+  for (let i = 0; i < n; i += step) out.push(arr[i])
+  if (out[out.length - 1] !== arr[n - 1]) out.push(arr[n - 1])
   return out
 }
 
@@ -107,12 +110,8 @@ export function MobileHero() {
 
   // Per-clip frame URLs after subsampling for this tier.
   const clipFrames = useMemo(
-    () => HERO_CLIPS.map(c => subsample(c.ids, tier.step).map(id => frameUrl(id, tier.transform))),
+    () => HERO_CLIPS.map(c => subsampleToTarget(c.ids, tier.target).map(id => frameUrl(id, tier.transform))),
     [tier]
-  )
-  const totalFrames = useMemo(
-    () => clipFrames.reduce((s, f) => s + f.length, 0),
-    [clipFrames]
   )
 
   // Image elements + load flags (compressed in memory; decoded on draw and
@@ -121,6 +120,7 @@ export function MobileHero() {
   const loadedRef    = useRef<boolean[][]>([])
   const frameTotals  = useRef<number[]>(clipFrames.map(f => f.length))
   const lastFrameIdx = useRef<number[]>(HERO_CLIPS.map(() => -1))
+  const lastOpacity  = useRef<number[]>(new Array(count).fill(-1))
 
   const sectionTopRef = useRef(0)
   const denomRef      = useRef(1)
@@ -139,77 +139,92 @@ export function MobileHero() {
 
   const { reportReady, setProgress: reportProgress } = useLoadingReporter()
   const videoReadyRef  = useRef(false)
-  const framesDoneRef  = useRef(false)
+  const burgerDoneRef  = useRef(false)
   const heroReadyRef   = useRef(false)
 
-  // ── Frame preloading (burger → wings → fries, with progress) ───────────────────
+  // ── Frame preloading ────────────────────────────────────────────────────────
+  // Reveal gates ONLY on the autoplay video + burger (the first clip scrubbed).
+  // Wings & fries stream in the background — the user spends seconds on the video
+  // and burger, so they're ready long before being viewed; until then the canvas
+  // shows the nearest loaded frame (frame 0), so nothing is ever blank.
   useEffect(() => {
     let alive = true
-    let loaded = 0
 
-    // (Re)initialise per-clip buffers for the chosen tier.
-    imagesRef.current   = clipFrames.map(f => f.map(() => null))
-    loadedRef.current   = clipFrames.map(f => f.map(() => false))
-    frameTotals.current = clipFrames.map(f => f.length)
+    imagesRef.current    = clipFrames.map(f => f.map(() => null))
+    loadedRef.current    = clipFrames.map(f => f.map(() => false))
+    frameTotals.current  = clipFrames.map(f => f.length)
     lastFrameIdx.current = clipFrames.map(() => -1)
+
+    const burgerTotal = clipFrames[0]?.length ?? 0
+    let burgerLoaded = 0
 
     const maybeReady = () => {
       if (heroReadyRef.current) return
-      if (framesDoneRef.current && videoReadyRef.current) {
+      if (burgerDoneRef.current && videoReadyRef.current) {
         heroReadyRef.current = true
         reportReady('hero')
       }
     }
-
-    const onOne = () => {
-      loaded++
-      // Reserve a sliver of the bar for the autoplay video so it only reaches
-      // 100% once everything (frames + video) is truly ready.
-      reportProgress('hero', (loaded / totalFrames) * 0.97 + (videoReadyRef.current ? 0.03 : 0))
-      if (loaded >= totalFrames) { framesDoneRef.current = true; maybeReady() }
+    const reportBurger = () => {
+      const frac = burgerTotal ? burgerLoaded / burgerTotal : 1
+      reportProgress('hero', frac * 0.97 + (videoReadyRef.current ? 0.03 : 0))
     }
 
-    const loadFrame = (ci: number, fi: number) => new Promise<void>(resolve => {
+    const loadFrame = (ci: number, fi: number, priority: 'high' | 'low') => new Promise<void>(resolve => {
+      if (!alive || loadedRef.current[ci]?.[fi]) return resolve()
       const img = new Image()
       img.decoding = 'async'
+      try { (img as HTMLImageElement & { fetchPriority?: string }).fetchPriority = priority } catch {}
       imagesRef.current[ci][fi] = img
       const done = () => {
         if (!alive) return resolve()
         loadedRef.current[ci][fi] = true
-        onOne()
+        if (ci === 0) {
+          burgerLoaded++
+          reportBurger()
+          if (burgerLoaded >= burgerTotal) { burgerDoneRef.current = true; maybeReady() }
+        }
+        img.decode?.().catch(() => {}) // warm the decode cache (browser-managed)
         resolve()
       }
       img.onload  = done
-      img.onerror = done // count errors too, so the loader can never hang
+      img.onerror = done // count errors too, so the gate can never hang
       img.src = clipFrames[ci][fi]
     })
 
-    const loadClip = async (ci: number) => {
+    const loadClip = async (ci: number, pool: number, priority: 'high' | 'low') => {
       const n = clipFrames[ci].length
       let next = 0
       const worker = async () => {
-        while (alive && next < n) { const fi = next++; await loadFrame(ci, fi) }
+        while (alive && next < n) { const fi = next++; await loadFrame(ci, fi, priority) }
       }
-      await Promise.all(Array.from({ length: Math.min(POOL_SIZE, n) }, worker))
+      await Promise.all(Array.from({ length: Math.min(pool, n) }, worker))
     }
 
-    // Clips load sequentially so burger is fully ready before wings, etc.
     ;(async () => {
-      for (let ci = 0; ci < CLIP_COUNT; ci++) {
-        if (!alive) break
-        await loadClip(ci)
-      }
+      // Instant fallback: first frame of wings & fries so they're never blank.
+      // Fire-and-forget at low priority — burger (high) still wins the pipe.
+      loadFrame(1, 0, 'low'); loadFrame(2, 0, 'low')
+      // Gate: burger in full, at high priority.
+      await loadClip(0, POOL_BURGER, 'high')
+      if (!alive) return
+      // Background: wings, then fries (frame 0 already cached → skipped).
+      await loadClip(1, POOL_BG, 'low')
+      if (!alive) return
+      await loadClip(2, POOL_BG, 'low')
     })()
 
-    return () => { alive = false }
-  }, [clipFrames, totalFrames, reportProgress, reportReady])
+    if (burgerTotal === 0) { burgerDoneRef.current = true; maybeReady() }
 
-  // Autoplay video readiness (folds into the same 'hero' loader group).
+    return () => { alive = false }
+  }, [clipFrames, reportProgress, reportReady])
+
+  // Autoplay video readiness (the other half of the reveal gate).
   const markVideoReady = useCallback(() => {
     if (videoReadyRef.current) return
     videoReadyRef.current = true
     if (heroReadyRef.current) return
-    if (framesDoneRef.current) {
+    if (burgerDoneRef.current) {
       heroReadyRef.current = true
       reportReady('hero')
     }
@@ -287,8 +302,8 @@ export function MobileHero() {
     return smoothstep((p - (boundary - halfFade)) / (halfFade * 2))
   }, [])
 
-  // Nearest already-loaded frame to `idx` (only matters if rendering ever races
-  // the download; after the loader lifts every frame is present and idx is exact).
+  // Nearest already-loaded frame to `idx` — guarantees the canvas always has
+  // something to draw even while a background clip is still streaming.
   const pickFrame = useCallback((ci: number, idx: number): HTMLImageElement | null => {
     const imgs = imagesRef.current[ci]
     const ld   = loadedRef.current[ci]
@@ -326,8 +341,8 @@ export function MobileHero() {
       const frameIdx = Math.min(total - 1, Math.floor(t * total))
       if (frameIdx === lastFrameIdx.current[fi]) continue
 
-      const img = pickFrame(fi, frameIdx)
-      const ctx = ctxRefs.current[fi]
+      const img    = pickFrame(fi, frameIdx)
+      const ctx    = ctxRefs.current[fi]
       const canvas = canvasRefs.current[fi]
       if (img && ctx && canvas) {
         lastFrameIdx.current[fi] = frameIdx
@@ -335,9 +350,16 @@ export function MobileHero() {
       }
     }
 
+    // Layer opacity + visibility culling (hidden layers aren't composited).
     for (let i = 0; i < count; i++) {
       const layer = layerRefs.current[i]
-      if (layer) layer.style.opacity = String(layerOpacity(i, p))
+      if (!layer) continue
+      const o = layerOpacity(i, p)
+      if (o !== lastOpacity.current[i]) {
+        lastOpacity.current[i] = o
+        layer.style.opacity = String(o)
+        if (i > 0) layer.style.visibility = o <= 0.001 ? 'hidden' : 'visible'
+      }
     }
 
     // Text: trigger when a layer is ~fully visible, fade out as the next arrives.
@@ -448,7 +470,7 @@ export function MobileHero() {
               key={clip.name}
               ref={el => { layerRefs.current[i] = el }}
               className="absolute inset-0"
-              style={{ opacity: 0, zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
+              style={{ opacity: 0, visibility: 'hidden', zIndex: i, willChange: 'opacity', transform: 'translateZ(0)' }}
               aria-hidden="true"
             >
               <canvas
