@@ -19,22 +19,18 @@ const LERP_BASE  = 0.22
 const LERP_SCALE = 0.22
 const LERP_CAP   = 0.9
 
-// Download concurrency. Burger gates the reveal so it gets a fat pool; the
-// background clips stay gentle to keep CPU free for buttery scrubbing.
-const POOL_BURGER = 8
-const POOL_BG     = 4
-
 /**
  * Device tier — decides how many frames to load and how heavy each one is, so
  * the weakest phone on the slowest link still loads fast and scrubs smoothly:
  *   target    = frames per clip after subsampling (fewer = less data + decode)
  *   transform = Cloudinary delivery (smaller width = far cheaper to decode/draw)
  *   dpr       = canvas backing-store density cap (lower = less GPU fill)
+ *   pool      = parallel downloads (higher = faster load, but more CPU)
  */
-type Tier = { target: number; transform: string; dpr: number }
-const TIER_HIGH: Tier = { target: 64, transform: 'f_auto,q_auto:eco',       dpr: 2    }
-const TIER_MID:  Tier = { target: 44, transform: 'f_auto,q_auto:eco,w_560', dpr: 1.5  }
-const TIER_LOW:  Tier = { target: 30, transform: 'f_auto,q_auto:low,w_420', dpr: 1.25 }
+type Tier = { target: number; transform: string; dpr: number; pool: number }
+const TIER_HIGH: Tier = { target: 64, transform: 'f_auto,q_auto:eco',       dpr: 2,    pool: 8 }
+const TIER_MID:  Tier = { target: 44, transform: 'f_auto,q_auto:eco,w_560', dpr: 1.5,  pool: 6 }
+const TIER_LOW:  Tier = { target: 30, transform: 'f_auto,q_auto:low,w_420', dpr: 1.25, pool: 4 }
 
 function detectTier(): Tier {
   if (typeof navigator === 'undefined') return TIER_HIGH
@@ -139,14 +135,14 @@ export function MobileHero() {
 
   const { reportReady, setProgress: reportProgress } = useLoadingReporter()
   const videoReadyRef  = useRef(false)
-  const burgerDoneRef  = useRef(false)
+  const framesDoneRef  = useRef(false)
   const heroReadyRef   = useRef(false)
 
   // ── Frame preloading ────────────────────────────────────────────────────────
-  // Reveal gates ONLY on the autoplay video + burger (the first clip scrubbed).
-  // Wings & fries stream in the background — the user spends seconds on the video
-  // and burger, so they're ready long before being viewed; until then the canvas
-  // shows the nearest loaded frame (frame 0), so nothing is ever blank.
+  // Reveal gates on the autoplay video + EVERY frame of all three clips (burger,
+  // wings, fries) — the whole hero is fully rendered before the page is shown.
+  // Frames load through one ordered pool (burger → wings → fries) so the gate
+  // finishes as fast as the device/link allows, with burger fetched first.
   useEffect(() => {
     let alive = true
 
@@ -155,18 +151,18 @@ export function MobileHero() {
     frameTotals.current  = clipFrames.map(f => f.length)
     lastFrameIdx.current = clipFrames.map(() => -1)
 
-    const burgerTotal = clipFrames[0]?.length ?? 0
-    let burgerLoaded = 0
+    const totalFrames = clipFrames.reduce((s, f) => s + f.length, 0)
+    let loaded = 0
 
     const maybeReady = () => {
       if (heroReadyRef.current) return
-      if (burgerDoneRef.current && videoReadyRef.current) {
+      if (framesDoneRef.current && videoReadyRef.current) {
         heroReadyRef.current = true
         reportReady('hero')
       }
     }
-    const reportBurger = () => {
-      const frac = burgerTotal ? burgerLoaded / burgerTotal : 1
+    const reportFrames = () => {
+      const frac = totalFrames ? loaded / totalFrames : 1
       reportProgress('hero', frac * 0.97 + (videoReadyRef.current ? 0.03 : 0))
     }
 
@@ -179,11 +175,9 @@ export function MobileHero() {
       const done = () => {
         if (!alive) return resolve()
         loadedRef.current[ci][fi] = true
-        if (ci === 0) {
-          burgerLoaded++
-          reportBurger()
-          if (burgerLoaded >= burgerTotal) { burgerDoneRef.current = true; maybeReady() }
-        }
+        loaded++
+        reportFrames()
+        if (loaded >= totalFrames) { framesDoneRef.current = true; maybeReady() }
         img.decode?.().catch(() => {}) // warm the decode cache (browser-managed)
         resolve()
       }
@@ -192,39 +186,32 @@ export function MobileHero() {
       img.src = clipFrames[ci][fi]
     })
 
-    const loadClip = async (ci: number, pool: number, priority: 'high' | 'low') => {
-      const n = clipFrames[ci].length
-      let next = 0
-      const worker = async () => {
-        while (alive && next < n) { const fi = next++; await loadFrame(ci, fi, priority) }
+    // One ordered queue across all clips (burger frames first → wings → fries),
+    // drained by `pool` parallel workers for maximum throughput.
+    const queue: [number, number][] = []
+    for (let ci = 0; ci < CLIP_COUNT; ci++)
+      for (let fi = 0; fi < clipFrames[ci].length; fi++) queue.push([ci, fi])
+
+    let qi = 0
+    const worker = async () => {
+      while (alive && qi < queue.length) {
+        const [ci, fi] = queue[qi++]
+        await loadFrame(ci, fi, ci === 0 ? 'high' : 'low')
       }
-      await Promise.all(Array.from({ length: Math.min(pool, n) }, worker))
     }
+    Promise.all(Array.from({ length: Math.min(tier.pool, queue.length || 1) }, worker))
 
-    ;(async () => {
-      // Instant fallback: first frame of wings & fries so they're never blank.
-      // Fire-and-forget at low priority — burger (high) still wins the pipe.
-      loadFrame(1, 0, 'low'); loadFrame(2, 0, 'low')
-      // Gate: burger in full, at high priority.
-      await loadClip(0, POOL_BURGER, 'high')
-      if (!alive) return
-      // Background: wings, then fries (frame 0 already cached → skipped).
-      await loadClip(1, POOL_BG, 'low')
-      if (!alive) return
-      await loadClip(2, POOL_BG, 'low')
-    })()
-
-    if (burgerTotal === 0) { burgerDoneRef.current = true; maybeReady() }
+    if (totalFrames === 0) { framesDoneRef.current = true; maybeReady() }
 
     return () => { alive = false }
-  }, [clipFrames, reportProgress, reportReady])
+  }, [clipFrames, tier.pool, reportProgress, reportReady])
 
   // Autoplay video readiness (the other half of the reveal gate).
   const markVideoReady = useCallback(() => {
     if (videoReadyRef.current) return
     videoReadyRef.current = true
     if (heroReadyRef.current) return
-    if (burgerDoneRef.current) {
+    if (framesDoneRef.current) {
       heroReadyRef.current = true
       reportReady('hero')
     }
